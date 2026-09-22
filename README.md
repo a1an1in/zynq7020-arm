@@ -24,7 +24,7 @@ petalinux-zynq7020/
     ├── build-image.sh        # 构建 docker 镜像
     ├── install-sdk.sh        # 用 auto-install.sh 装 SDK 到 sdk/卷
     ├── unpack-offline.sh     # 解压 downloads/sstate 离线包
-    └── run.sh                # 进入容器做工程开发(日常入口)
+    └── devops.sh                # 进入容器做工程开发(日常入口)
 ```
 
 `docker/patches/` 预留放需要的补丁(当前版本未用)。
@@ -44,7 +44,7 @@ petalinux-zynq7020/
 ./utils/build-image.sh      # 1. 构建 Docker 镜像(一次性,只装 OS+依赖)
 ./utils/install-sdk.sh      # 2. 安装 PetaLinux SDK 到 sdk/(前置:已下载安装器与离线包)
 ./utils/unpack-offline.sh   # 3. 解压 downloads/sstate 离线包(可选但推荐,离线编译用)
-./utils/run.sh              # 4. 进容器 → source settings.sh → cd src/zynq7020 → petalinux-build
+./utils/devops.sh              # 4. 进容器 → source settings.sh → cd src/zynq7020 → petalinux-build
 ```
 
 > 前置下载 - `petalinux-v2021.1-final-installer.run`、`downloads_2021.1_update1.tar.gz`、

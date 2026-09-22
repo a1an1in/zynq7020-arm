@@ -81,4 +81,4 @@ fi
 echo ">> SDK 安装完成:"
 echo "    已生成: ${SDK_HOST_DIR}/petalinux/settings.sh"
 echo "    大小:   $(du -sh "${SDK_HOST_DIR}/petalinux" 2>/dev/null | cut -f1)"
-echo ">> 下一步: utils/unpack-offline.sh 解压离线包，然后 utils/run.sh 进入工程开发"
+echo ">> 下一步: utils/unpack-offline.sh 解压离线包，然后 utils/devops.sh 进入工程开发"

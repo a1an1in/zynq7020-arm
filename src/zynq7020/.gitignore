@@ -10,3 +10,8 @@ pre-built/linux/
 *.log
 /components/plnx_workspace
 /components/yocto
+# Xilinx 工具运行时元数据(含容器 hostname 命名子目录,构建自动重建)
+.Xil/
+
+# PetaLinux 自动重建的软链接(指向 SDK 的 /opt/xilinx/petalinux/tools)
+/tools
