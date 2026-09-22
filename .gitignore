@@ -1,0 +1,66 @@
+# ===== 大体积离线资源(不入库,自行下载) =====
+# Docker 构建相关大文件:PetaLinux 安装器 + 离线源码/sstate 包(数十 GB)
+docker/archives/
+
+# 常见离线包后缀(若散落到其他位置也不跟踪)
+*.run
+*.tar.gz
+*.tgz
+
+# ===== PetaLinux SDK 持久卷 =====
+# sdk/ 为挂载到容器 /opt/xilinx 的持久卷,含数千文件且体积大(PetaLinux+downloads+sstate 可到数十 GB)
+sdk/
+
+# ===== PetaLinux 工程编译产物(次级 .gitignore 亦已覆盖,这里做兜底) =====
+src/zynq7020/build/
+src/zynq7020/images/linux/
+src/zynq7020/pre-built/linux/
+src/zynq7020/.petalinux/
+src/zynq7020/components/plnx_workspace/
+src/zynq7020/components/yocto/
+src/zynq7020/sdk/
+
+# ===== 通用工具/编辑器产物 =====
+*.o
+*.jou
+*.log
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+
+# ===== PetaLinux 硬件描述(hw-description) =====
+# 只跟踪权威硬件源 system.xsa(构建配置 HDF_PATH 直接引用)
+# 与比特流 system_wrapper.bit(plnxtool.conf 的 EXTRA_FILESLIST 直接引用)。
+# 其余 ps7_init.* / metadata 均由 `petalinux-config --get-hw-description`
+# 从 system.xsa 重新解出,属派生物:体积大且内容为寄存器写表,diff 噪音极高,不入库。
+src/zynq7020/project-spec/hw-description/ps7_init.c
+src/zynq7020/project-spec/hw-description/ps7_init.h
+src/zynq7020/project-spec/hw-description/ps7_init_gpl.c
+src/zynq7020/project-spec/hw-description/ps7_init_gpl.h
+src/zynq7020/project-spec/hw-description/ps7_init.tcl
+src/zynq7020/project-spec/hw-description/ps7_init.html
+src/zynq7020/project-spec/hw-description/metadata
+
+# ===== 本地运维笔记(含明文凭据,严禁入库) =====
+# utils/NOT_DELETE.md 记录线上容器灾难恢复命令,内含 MySQL root 密码与阿里云 AK/SK,
+# 属本地私密笔记,绝不提交。建议凭据改用环境变量注入,并轮换此处已暴露的 key。
+utils/NOT_DELETE.md
+
+# ===== 环境变量 / 密钥文件 =====
+.env
+.env.*
+*.env
+*.pem
+*.key
+
+# ===== 编辑器 / 系统 / 补丁残留 =====
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.orig
+*.rej
+*.bak
+core
