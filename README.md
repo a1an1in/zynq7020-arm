@@ -19,7 +19,7 @@ petalinux-zynq7020/
 │   ├── petalinux/            #   ← SDK 本体(安装器写入 /opt/xilinx/petalinux)
 │   ├── downloads/            #   ← 离线源码 pre-mirror
 │   └── sstate/arm/           #   ← 32 位 sstate 缓存
-├── zynq7020-arm/              # petalinux 工程(arm,容器内 /work/zynq7020-arm)
+├── src/              # petalinux 工程(arm,容器内 /work/src)
 └── utils/
     ├── build-image.sh        # 构建 docker 镜像
     ├── install-sdk.sh        # 用 auto-install.sh 装 SDK 到 sdk/卷
@@ -44,7 +44,7 @@ petalinux-zynq7020/
 ./utils/build-image.sh      # 1. 构建 Docker 镜像(一次性,只装 OS+依赖)
 ./utils/install-sdk.sh      # 2. 安装 PetaLinux SDK 到 sdk/(前置:已下载安装器与离线包)
 ./utils/unpack-offline.sh   # 3. 解压 downloads/sstate 离线包(可选但推荐,离线编译用)
-./utils/devops.sh              # 4. 进容器 → source settings.sh → cd zynq7020-arm → petalinux-build
+./utils/devops.sh              # 4. 进容器 → source settings.sh → cd src → petalinux-build
 ```
 
 > 前置下载 - `petalinux-v2021.1-final-installer.run`、`downloads_2021.1_update1.tar.gz`、
@@ -54,7 +54,7 @@ petalinux-zynq7020/
 ## 体积与换机
 
 - SDK 卷 `sdk/` 是唯一需要持久保留的东西;换机时把它整体拷走 + 重建镜像即可。
-- petalinux 工程放在仓库根目录 `zynq7020-arm/`(容器内 `/work/zynq7020-arm`),不进 sdk 卷,方便随代码一起管理。
+- petalinux 工程放在仓库根目录 `src/`(容器内 `/work/src`),不进 sdk 卷,方便随代码一起管理。
 - 离线包比较大,已解压后原 `.tar.gz` 可删除以省空间(见米联客手册第 5.2 节)。
 
 ## 说明与坑

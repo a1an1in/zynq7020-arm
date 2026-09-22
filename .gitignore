@@ -12,13 +12,13 @@ docker/archives/
 sdk/
 
 # ===== PetaLinux 工程编译产物(次级 .gitignore 亦已覆盖,这里做兜底) =====
-src/zynq7020/build/
-src/zynq7020/images/linux/
-src/zynq7020/pre-built/linux/
-src/zynq7020/.petalinux/
-src/zynq7020/components/plnx_workspace/
-src/zynq7020/components/yocto/
-src/zynq7020/sdk/
+src/build/
+src/images/linux/
+src/pre-built/linux/
+src/.petalinux/
+src/components/plnx_workspace/
+src/components/yocto/
+src/sdk/
 
 # ===== 通用工具/编辑器产物 =====
 *.o
@@ -34,13 +34,13 @@ __pycache__/
 # 与比特流 system_wrapper.bit(plnxtool.conf 的 EXTRA_FILESLIST 直接引用)。
 # 其余 ps7_init.* / metadata 均由 `petalinux-config --get-hw-description`
 # 从 system.xsa 重新解出,属派生物:体积大且内容为寄存器写表,diff 噪音极高,不入库。
-src/zynq7020/project-spec/hw-description/ps7_init.c
-src/zynq7020/project-spec/hw-description/ps7_init.h
-src/zynq7020/project-spec/hw-description/ps7_init_gpl.c
-src/zynq7020/project-spec/hw-description/ps7_init_gpl.h
-src/zynq7020/project-spec/hw-description/ps7_init.tcl
-src/zynq7020/project-spec/hw-description/ps7_init.html
-src/zynq7020/project-spec/hw-description/metadata
+src/project-spec/hw-description/ps7_init.c
+src/project-spec/hw-description/ps7_init.h
+src/project-spec/hw-description/ps7_init_gpl.c
+src/project-spec/hw-description/ps7_init_gpl.h
+src/project-spec/hw-description/ps7_init.tcl
+src/project-spec/hw-description/ps7_init.html
+src/project-spec/hw-description/metadata
 
 # ===== 本地运维笔记(含明文凭据,严禁入库) =====
 # utils/NOT_DELETE.md 记录线上容器灾难恢复命令,内含 MySQL root 密码与阿里云 AK/SK,

@@ -27,8 +27,8 @@ else
 fi
 
 mkdir -p "${SDK_HOST_DIR}"/{petalinux,downloads,sstate}
-# petalinux 工程放在仓库根目录 zynq7020-arm/(容器内通过 ${HERE}:/work 挂载为 /work/zynq7020-arm)
-mkdir -p "${HERE}/zynq7020-arm"
+# petalinux 工程放在仓库根目录 src/(容器内通过 ${HERE}:/work 挂载为 /work/src)
+mkdir -p "${HERE}/src"
 
 # 只读挂载离线源，若存在
 MOUNTS_OFFLINE=()
@@ -57,8 +57,8 @@ if [ "$#" -eq 0 ]; then
     -u plsdk \
     "${IMG_NAME}"
 else
-  # 工程容器内路径可用 PETALINUX_PROJ 覆盖,默认 /work/zynq7020-arm。
-  PROJ_DIR="${PETALINUX_PROJ:-/work/zynq7020-arm}"
+  # 工程容器内路径可用 PETALINUX_PROJ 覆盖,默认 /work/src。
+  PROJ_DIR="${PETALINUX_PROJ:-/work/src}"
   exec docker run --rm -i "${DOCKER_TTY[@]}" --network host \
     -e TERM=xterm \
     ${MOUNTS_OFFLINE[@]+"${MOUNTS_OFFLINE[@]}"} \
