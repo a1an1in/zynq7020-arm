@@ -11,7 +11,7 @@
 #       直接带命令(自动 source settings.sh 并 cd 到工程)：
 #       ./utils/devops.sh petalinux-build
 #       ./utils/devops.sh petalinux-package --boot --u-boot --fpga --force
-#       # 工程容器内路径可覆盖:PETALINUX_PROJ=/work/src/<名>
+#       # 工程容器内路径可覆盖:PETALINUX_PROJ=/work/<名>
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,8 +27,8 @@ else
 fi
 
 mkdir -p "${SDK_HOST_DIR}"/{petalinux,downloads,sstate}
-# petalinux 工程放在仓库根目录 src/(容器内通过 ${HERE}:/work 挂载为 /work/src)
-mkdir -p "${HERE}/src"
+# petalinux 工程放在仓库根目录 zynq7020-arm/(容器内通过 ${HERE}:/work 挂载为 /work/zynq7020-arm)
+mkdir -p "${HERE}/zynq7020-arm"
 
 # 只读挂载离线源，若存在
 MOUNTS_OFFLINE=()
@@ -57,8 +57,8 @@ if [ "$#" -eq 0 ]; then
     -u plsdk \
     "${IMG_NAME}"
 else
-  # 工程容器内路径可用 PETALINUX_PROJ 覆盖,默认 /work/src/zynq7020。
-  PROJ_DIR="${PETALINUX_PROJ:-/work/src/zynq7020}"
+  # 工程容器内路径可用 PETALINUX_PROJ 覆盖,默认 /work/zynq7020-arm。
+  PROJ_DIR="${PETALINUX_PROJ:-/work/zynq7020-arm}"
   exec docker run --rm -i "${DOCKER_TTY[@]}" --network host \
     -e TERM=xterm \
     ${MOUNTS_OFFLINE[@]+"${MOUNTS_OFFLINE[@]}"} \
