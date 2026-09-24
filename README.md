@@ -34,6 +34,7 @@ petalinux-zynq7020/
 本 README 是总纲,模块化、细节化文档放在 `doc/` 下:
 
 - [`doc/环境与编译.md`](doc/环境与编译.md) —— 环境搭建(Docker 镜像 / SDK / 离线包 / 进容器)+ 工程编译与打包
+- [`doc/调试与烧写方法.md`](doc/调试与烧写方法.md) —— 调试期间镜像烧写方法(SD/QSPI/JTAG + TFTP/NFS、配合 Linux 调试)
 - 业务模块说明(如 `gpio-demo`、`peekpoke`)规划中,后续随模块文档补进 `doc/`
 
 ## 使用流程
@@ -62,4 +63,3 @@ petalinux-zynq7020/
 - 基镜像用 Ubuntu 18.04(PetaLinux 2021.1 官方支持),20.04 缺 `libncurses5/libtinfo5`,易踩坑。
 - Zynq-7000 是 32 位:模板用 `--template zynq`,sstate 用 `arm`,不是 zynqMP/aarch64。
 - PetaLinux 安装器**拒绝 root 运行**,镜像内以 `plsdk` 用户(与宿主 UID/GID 对齐)执行。
-- 更完整的坑提示见 [`doc/环境与编译.md`](doc/环境与编译.md)。
