@@ -15,7 +15,8 @@ sdk/
 src/build/
 src/images/linux/
 src/pre-built/linux/
-src/.petalinux/
+# 忽略 .petalinux 下的运行时元数据，但放行工程身份标识 metadata(见 src/.gitignore)
+src/.petalinux/*
 src/components/plnx_workspace/
 src/components/yocto/
 src/sdk/
