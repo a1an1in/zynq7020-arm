@@ -194,11 +194,13 @@ fs_change_report() {
   : > "$upd"; : > "$del"; : > "$src"; : > "$unch"
 
   # 已更新(新增/覆盖):字段1是状态字(如 >f+++++++++),字段2是相对路径;
-  # 排除 汇总行(sending/receiving) 与 删除行(deleting)。
-  awk 'NF>1 && $1!="sending" && $1!="receiving" && $1!~"deleting" && $1!~"Warning" && $1!~"Permanently" { p=$2; sub(/^\//,"",p); print p }' "$out" \
+  # 排除 汇总行(sending/receiving) 与 删除行(deleting);再扔掉目录条目(以 / 结尾,
+  # 因删子文件/写文件会改到父目录 mtime,这类属性更新不算"变化文件")。
+  awk 'NF>1 && $1!="sending" && $1!="receiving" && $1!~"deleting" && $1!~"Warning" && $1!~"Permanently" \
+       { p=$2; sub(/^\//,"",p); if (p !~ /\/$/) print p }' "$out" \
     | sort -u > "$upd"
-  # 镜像删除:形如 "deleting path" 或 "*deleting path"
-  sed -nE 's/^[*]?deleting[[:space:]]+//p' "$out" | sort -u > "$del"
+  # 镜像删除:形如 "deleting path" 或 "*deleting path";同样丢弃目录条目
+  sed -nE 's/^[*]?deleting[[:space:]]+//p' "$out" | awk '!/\/$/' | sort -u > "$del"
   # 源全集(仅普通文件/软链,相对根)
   ( cd "$srcdir" 2>/dev/null && find . \( -type f -o -type l \) | sed 's#^\./##' ) | sort -u > "$src"
   # 未变化 = 源全集 - 已更新(目标已与源一致)
@@ -211,8 +213,7 @@ fs_change_report() {
   awk '{ print "      +  " $0 }' "$upd"
   echo "  ✖ 镜像删除(源已无,板上已删): $ndel 个"
   awk '{ print "      -  " $0 }' "$del"
-  echo "  ○ 未变化(目标已与源一致): $nunch 个"
-  awk '{ print "      .  " $0 }' "$unch"
+  echo "  ○ 未变化(目标已与源一致): $nunch 个(均为一致,不再逐条列出)"
 
   rm -f "$upd" "$del" "$src" "$unch"
 }
