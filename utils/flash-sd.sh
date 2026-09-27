@@ -12,7 +12,7 @@
 #                    <选项>二选一:
 #                      -b|--boot  只同步 boot(FAT)启动模块(BOOT.BIN/image.ub/boot.scr 等)
 #                                    用 scp 拷贝、只增不删(板上 dropbear/busybox 常无 rsync)
-#                      -f|--fs    增量+镜像删除地同步文件系统(rootfs,ext4;用本工程交叉静态 rsync,板上自举+--numeric-ids)
+#                      -f|--fs    增量+镜像删除地同步文件系统(源=目录或 .tar.gz/.tgz,归档自动解压且同步后删;输出文件级变更明细)
 #                    <设备>为板上目标 SD 块设备(mmcblk0 或 /dev/mmcblk0);
 #                    必须显式指定 源目录/板IP/设备,均无默认;会先校验设备为 SD 卡(removable=1 或 device/type=SD)后才操作。
 #
@@ -185,10 +185,44 @@ release() {
   done
 }
 
+# ---- 生成并打印 -f 的"文件级变更明细" ---------------------------------------
+# $1 = rsync -i 的原样输出日志文件; $2 = 本地源目录(用于求"未变化 = 源全集 - 已更新")
+# 解析 rsync itemize 行(status + 路径)与 deleting 行,给出 新增/更新、镜像删除、未变化 三类 + 完整清单。
+fs_change_report() {
+  local out="$1" srcdir="$2"
+  local upd="$out.upd" del="$out.del" src="$out.src" unch="$out.unch"
+  : > "$upd"; : > "$del"; : > "$src"; : > "$unch"
+
+  # 已更新(新增/覆盖):字段1是状态字(如 >f+++++++++),字段2是相对路径;
+  # 排除 汇总行(sending/receiving) 与 删除行(deleting)。
+  awk 'NF>1 && $1!="sending" && $1!="receiving" && $1!~"deleting" && $1!~"Warning" && $1!~"Permanently" { p=$2; sub(/^\//,"",p); print p }' "$out" \
+    | sort -u > "$upd"
+  # 镜像删除:形如 "deleting path" 或 "*deleting path"
+  sed -nE 's/^[*]?deleting[[:space:]]+//p' "$out" | sort -u > "$del"
+  # 源全集(仅普通文件/软链,相对根)
+  ( cd "$srcdir" 2>/dev/null && find . \( -type f -o -type l \) | sed 's#^\./##' ) | sort -u > "$src"
+  # 未变化 = 源全集 - 已更新(目标已与源一致)
+  comm -23 "$src" "$upd" > "$unch" || true
+
+  local nupd ndel nunch
+  nupd=$(wc -l < "$upd"); ndel=$(wc -l < "$del"); nunch=$(wc -l < "$unch")
+  echo ">> --- 文件级变更明细 ---"
+  echo "  ♻ 新增/更新: $nupd 个"
+  awk '{ print "      +  " $0 }' "$upd"
+  echo "  ✖ 镜像删除(源已无,板上已删): $ndel 个"
+  awk '{ print "      -  " $0 }' "$del"
+  echo "  ○ 未变化(目标已与源一致): $nunch 个"
+  awk '{ print "      .  " $0 }' "$unch"
+
+  rm -f "$upd" "$del" "$src" "$unch"
+}
+
+# ---- deploy: SSH 登板,同步模块到板上指定 SD 设备 --------------------------------
 # ---- deploy: SSH 登板,同步模块到板上指定 SD 设备 --------------------------------
 # 用法: deploy <-b|--boot | -f|--fs> <源目录> <root@板IP> <设备>
 #   -b/--boot  只同步 boot(FAT)启动模块(BOOT.bin/image.ub/boot.scr 等,排除 rootfs)
-#   -f/--fs    增量同步文件系统(rsync -a 到 rootfs/ext4 分区,只传变化文件)
+#   -f/--fs    增量+镜像删除同步文件系统(源=目录或 rootfs 归档 .tar.gz/.tgz——归档自动解压,同步后删临时;
+#              输出文件级变更明细:新增/更新、镜像删除、未变化)
 #   <源目录>   本地待同步目录(无默认)
 #   <root@板IP> SSH 目标(用户/密码均为 root)
 #   <设备>     板上目标 SD 块设备,可写设备名或路径(如 mmcblk0 / /dev/mmcblk0)
@@ -211,7 +245,11 @@ do_deploy() {
   fi
   { [ -n "$src" ] && [ -n "$dst" ] && [ -n "$dev" ]; } || \
     { echo "[错误] 用法: flash-sd.sh deploy -b|-f <源目录> <root@板IP> <设备>" >&2; return 1; }
-  [ -d "$src" ] || { echo "[错误] 源目录不存在: $src" >&2; return 1; }
+  if [ "$mode" = fs ]; then
+    [ -d "$src" ] || [ -f "$src" ] || { echo "[错误] 文件系统源不存在(应为目录或 .tar.gz/.tgz 归档): $src" >&2; return 1; }
+  else
+    [ -d "$src" ] || { echo "[错误] 源目录不存在: $src" >&2; return 1; }
+  fi
   # 提取 IP(允许 root@1.2.3.4 或 1.2.3.4)
   case "$dst" in
     root@*|user@*) ip="${dst#*@}" ;;
@@ -267,7 +305,17 @@ do_deploy() {
   read -r dev mountpoint < <(sshpass -p root ssh $SSHOPTS "root@$ip" \
     "awk -v d='$remote_dev' -v t='$tgt_fstype' '\$1 ~ (\"^\" d \"p\") && \$3==t {print \$1, \$2; exit}' /proc/mounts" 2>/dev/null) || true
   if [ -z "$dev" ] || [ -z "$mountpoint" ]; then
-    echo "[错误] 设备 $remote_dev 下找不到已挂载的 $tgt_fstype 分区(确认分区已创建且已自动挂载;若未挂载请先 mount)" >&2; return 1
+    # 目标分区未挂载:尝试自动挂载(本板约定 boot=p1、fs=p2)到 /mnt/deploy-<mode>,再校验。
+    local pnum=1; [ "$mode" = fs ] && pnum=2
+    local rdev="${remote_dev#/dev/}"
+    dev="/dev/${rdev}p${pnum}"
+    mountpoint="/mnt/deploy-${mode}-${rdev}p${pnum}"
+    echo ">> 分区未挂载,尝试自动挂载 ${dev} → ${mountpoint} ..."
+    if ! sshpass -p root ssh $SSHOPTS "root@$ip" \
+        "mkdir -p '$mountpoint' && mount '$dev' '$mountpoint' >/dev/null 2>&1 && grep -q '$dev $mountpoint ' /proc/mounts" 2>/dev/null; then
+      echo "[错误] 自动挂载 ${dev} 失败(确认分区已建;或先手动 mount 再重试)" >&2; return 1
+    fi
+    echo ">> 已自动挂载,后续同步结束会 umount"
   fi
   echo ">> 目标分区: $dev  挂载点: $mountpoint  ($tgt_fstype)"
 
@@ -287,22 +335,44 @@ do_deploy() {
       sshpass -p root scp $SSHOPTS -p "$f" "root@$ip:${mountpoint}/" >/dev/null || { echo "[!] 拷贝失败: $f" >&2; rc=1; }
     done
   else
-    # fs(ext4):增量+镜像删除需板上 rsync。本工程已把交叉静态 rsync(armv7,关 FORTIFY)放到板上
-    # boot(vfat)分区 tools/rsync 作持久副本;但板 / 是 ram(/usr/bin 副本重启即丢,PATH 内只有它),
-    # 故每次先自举:从任一已挂载 vfat 分区 tools/rsync 复制到 /usr/bin。嵌入式统一用 --numeric-ids
-    # (不做 uid/gid→用户名 NSS 解析——静态 rsync 在无 NSS 库的板上会段错误)。
+    # fs(ext4):增量+镜像删除需板上 rsync(工程交叉静态版,板上自举;--numeric-ids 免静态 rsync
+    # 在无 NSS 库的板上做 uid→名解析致段错误)。源可为目录,也为 rootfs 归档(.tar.gz/.tgz/...):
+    # 若是归档则自动解压到临时目录,同步完成后删除。
+    local srcdir="$src" tarsrc=""
+    case "$src" in
+      *.tar.gz|*.tgz|*.tar)
+        tarsrc="$(mktemp -d /tmp/deploy-fs.XXXXXX)"
+        if ! tar -xzf "$src" -C "$tarsrc" >/dev/null 2>&1; then
+          echo "[错误] 解压源失败: $src" >&2; rm -rf "$tarsrc"; return 1
+        fi
+        echo ">> 源 $(basename "$src") 是归档,已解压到临时目录 $tarsrc(同步后自动清理)"
+        srcdir="$tarsrc"
+        if ( cd "$tarsrc" && [ $(ls -A | wc -l) -eq 1 ] ); then
+          local only; only="$(cd "$tarsrc" && echo ./*)"; [ -d "$only" ] && srcdir="$only"
+        fi
+        ;;
+    esac
     if sshpass -p root ssh $SSHOPTS "root@$ip" \
         'if ! command -v rsync >/dev/null 2>&1; then for m in $(grep " vfat " /proc/mounts | cut -d" " -f2); do if [ -x "$m/tools/rsync" ]; then cp "$m/tools/rsync" /usr/bin/rsync; chmod 755 /usr/bin/rsync; echo ">> 已从 $m/tools/rsync 拉起板上 rsync"; break; fi; done; fi; command -v rsync' \
         >/dev/null; then
-      sshpass -p root rsync -a --delete --delete-during --numeric-ids \
-        -e "sshpass -p root ssh $SSHOPTS" \
-        "${src}/" "root@$ip:${mountpoint}/" || rc=1
+      local rlog; rlog="$(mktemp /tmp/deploy-rsync.XXXXXX)"
+      echo ">> 同步 ${srcdir}/ → 板上 ${mountpoint}/ ..."
+      if sshpass -p root rsync -i -a --delete --delete-during --numeric-ids \
+          -e "sshpass -p root ssh $SSHOPTS" \
+          "${srcdir}/" "root@$ip:${mountpoint}/" >"$rlog" 2>&1; then
+        fs_change_report "$rlog" "$srcdir"
+      else
+        echo "[!] rsync 同步出错,最近输出:" >&2
+        tail -30 "$rlog" >&2
+        rc=1
+      fi
+      rm -f "$rlog"
     else
       echo "[错误] 板上无 rsync 且自举失败(boot 分区未挂载,或其 tools/rsync 副本缺失)。" >&2
       echo "        mount -t vfat /dev/${remote_dev}p1 /mnt 后重试;或经 utils 把静态 rsync 放 boot 的 tools/。" >&2
-      echo "        遗留 tar 全量替代:tar -C '$src' -cf - . | sshpass -p root ssh $SSHOPTS root@$ip 'tar -C ${mountpoint} -xf -'  (覆盖同名,不删远端多余)" >&2
       rc=1
     fi
+    { [ -n "$tarsrc" ] && rm -rf "$tarsrc"; } || true
   fi
   sshpass -p root ssh $SSHOPTS "root@$ip" "sync; umount '$mountpoint' 2>/dev/null || true" >/dev/null 2>&1
   if [ $rc -eq 0 ]; then echo ">> deploy($mode) 完成。拔电/reboot 后生效。"; else echo "[!] 同步出错(退出码 $rc)"; return $rc; fi
