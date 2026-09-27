@@ -12,7 +12,7 @@
 #                    <选项>二选一:
 #                      -b|--boot  只同步 boot(FAT)启动模块(BOOT.BIN/image.ub/boot.scr 等)
 #                                    用 scp 拷贝、只增不删(板上 dropbear/busybox 常无 rsync)
-#                      -f|--fs    增量同步文件系统(rootfs,ext4;依赖板上装有 rsync,缺失时给出替代)
+#                      -f|--fs    增量+镜像删除地同步文件系统(rootfs,ext4;用本工程交叉静态 rsync,板上自举+--numeric-ids)
 #                    <设备>为板上目标 SD 块设备(mmcblk0 或 /dev/mmcblk0);
 #                    必须显式指定 源目录/板IP/设备,均无默认;会先校验设备为 SD 卡(removable=1 或 device/type=SD)后才操作。
 #
@@ -287,15 +287,20 @@ do_deploy() {
       sshpass -p root scp $SSHOPTS -p "$f" "root@$ip:${mountpoint}/" >/dev/null || { echo "[!] 拷贝失败: $f" >&2; rc=1; }
     done
   else
-    # fs(ext4):增量同步需板上 rsync;板上(busybox/dropbear 精简环境)通常没有,此时明确提示。
-    if sshpass -p root ssh $SSHOPTS "root@$ip" 'command -v rsync' >/dev/null 2>&1; then
-      sshpass -p root rsync -a --delete --delete-during \
+    # fs(ext4):增量+镜像删除需板上 rsync。本工程已把交叉静态 rsync(armv7,关 FORTIFY)放到板上
+    # boot(vfat)分区 tools/rsync 作持久副本;但板 / 是 ram(/usr/bin 副本重启即丢,PATH 内只有它),
+    # 故每次先自举:从任一已挂载 vfat 分区 tools/rsync 复制到 /usr/bin。嵌入式统一用 --numeric-ids
+    # (不做 uid/gid→用户名 NSS 解析——静态 rsync 在无 NSS 库的板上会段错误)。
+    if sshpass -p root ssh $SSHOPTS "root@$ip" \
+        'if ! command -v rsync >/dev/null 2>&1; then for m in $(grep " vfat " /proc/mounts | cut -d" " -f2); do if [ -x "$m/tools/rsync" ]; then cp "$m/tools/rsync" /usr/bin/rsync; chmod 755 /usr/bin/rsync; echo ">> 已从 $m/tools/rsync 拉起板上 rsync"; break; fi; done; fi; command -v rsync' \
+        >/dev/null; then
+      sshpass -p root rsync -a --delete --delete-during --numeric-ids \
         -e "sshpass -p root ssh $SSHOPTS" \
         "${src}/" "root@$ip:${mountpoint}/" || rc=1
     else
-      echo "[错误] 板上无 rsync,-f 增量同步无法执行。两种选择:" >&2
-      echo "          1) 先给板装 rsync(嵌入式 petalinux 可构建 rsync 打包后上板);" >&2
-      echo "          2) 改用全量:tar -C '$src' -cf - . | sshpass -p root ssh $SSHOPTS root@$ip 'tar -C ${mountpoint} -xf -'  (覆盖同名字,但不删远端额外文件)" >&2
+      echo "[错误] 板上无 rsync 且自举失败(boot 分区未挂载,或其 tools/rsync 副本缺失)。" >&2
+      echo "        mount -t vfat /dev/${remote_dev}p1 /mnt 后重试;或经 utils 把静态 rsync 放 boot 的 tools/。" >&2
+      echo "        遗留 tar 全量替代:tar -C '$src' -cf - . | sshpass -p root ssh $SSHOPTS root@$ip 'tar -C ${mountpoint} -xf -'  (覆盖同名,不删远端多余)" >&2
       rc=1
     fi
   fi
