@@ -10,10 +10,11 @@
 #   deploy <选项> <源目录> <root@板IP> <设备>
 #                    SSH 登板(用户/密码 root/root),把本地源同步到板上的 SD 分区。
 #                    <选项>二选一:
-#                      -b|--boot  只同步 boot(FAT)启动模块(HOOT.bin/image.ub/boot.scr 等)
-#                      -f|--fs    增量同步文件系统(rootfs,ext4+rsync --delete,只传变化文件)
+#                      -b|--boot  只同步 boot(FAT)启动模块(BOOT.BIN/image.ub/boot.scr 等)
+#                                    用 scp 拷贝、只增不删(板上 dropbear/busybox 常无 rsync)
+#                      -f|--fs    增量同步文件系统(rootfs,ext4;依赖板上装有 rsync,缺失时给出替代)
 #                    <设备>为板上目标 SD 块设备(mmcblk0 或 /dev/mmcblk0);
-#                    必须显式指定 源目录/板IP/设备,均无默认;会先校验设备为可移动 SD 后才操作。
+#                    必须显式指定 源目录/板IP/设备,均无默认;会先校验设备为 SD 卡(removable=1 或 device/type=SD)后才操作。
 #
 # 源(SOURCE): 一律为目录路径;省略时默认官方出厂设置包
 #   /mnt/c/Users/a1an1in/workspace/xlinx/F6_7020/V2022/01_user_start/02_start_linux/03_restore_factory/rst_to_factory_img/rst_to_factory_img/sdcard_image
@@ -229,53 +230,75 @@ do_deploy() {
     echo "[错误] 无法 SSH 到 ${ip}(确认板已联网、sshd 已启动、密码为 root)" >&2; return 1
   fi
 
-  # ---- 校验目标设备:存在 & 确实是可移动 SD 卡(removable=1) ----
-  local rem bname
+  # ---- 校验目标设备:确实存在 & 是 SD 卡而非内嵌存储 ----
+  # WSL/USB 读卡器/可插拔卡一般设 removable=1;但板载 SDIO 槽(本 Zynq 即如此)的
+  # MMC/SD 控制器驱动不设置 removable(恒 0),故退化为用 device/type 区分 SD 卡 vs 内嵌 eMMC。
+  local bname dtype rem
   bname="$(basename "$remote_dev")"
   rem=$(sshpass -p root ssh $SSHOPTS "root@$ip" \
-    "[ -e '$remote_dev' ] && cat /sys/block/$bname/removable 2>/dev/null" 2>/dev/null | head -1)
+    "[ -e '$remote_dev' ] && cat /sys/block/$bname/removable 2>/dev/null" 2>/dev/null | head -1 || true)
   if [ -z "$rem" ]; then
     echo "[错误] 板上不存在目标设备 $remote_dev,或读取 removable 失败" >&2; return 1
   fi
-  if [ "$rem" != "1" ]; then
-    echo "[错误] $remote_dev 不是可移动介质(SD 卡 removable=1,此处=$rem)。板上可移动盘:"
-    sshpass -p root ssh $SSHOPTS "root@$ip" \
-      "for d in /sys/block/*/removable; do [ \"\$(cat \$d 2>/dev/null)\" = 1 ] && echo '  /dev/'\$(basename \$(dirname \$d)); done" >&2 2>/dev/null
-    return 1
+  if [ "$rem" = "1" ]; then
+    echo ">> 目标设备 $remote_dev 已确认为可移动 SD 介质 ✅"
+  else
+    dtype=$(sshpass -p root ssh $SSHOPTS "root@$ip" \
+      "cat /sys/block/$bname/device/type 2>/dev/null" 2>/dev/null | head -1 || true)
+    case "$dtype" in
+      "" ) echo "[错误] 无法读取 $remote_dev 的类型(removable=$rem 且 device/type 为空)" >&2; return 1 ;;
+      SD*|SDIO )
+        echo ">> 板上未提供 removable 标记(板载 SD 槽常见,=0),按 device/type=$dtype 判定 $remote_dev 为 SD 卡 ✅" ;;
+      * )
+        echo "[错误] $remote_dev 不是 SD 介质(device/type=$dtype,疑似内嵌 eMMC/本地盘),拒绝操作。板上 mmc 设备:"
+        sshpass -p root ssh $SSHOPTS "root@$ip" \
+          "for d in /sys/block/mmcblk*/device/type; do b=\$(basename \$(dirname \$(dirname \"\$d\"))); t=\$(cat \"\$d\" 2>/dev/null); echo \"  /dev/\$b  type=\$t\"; done" 2>/dev/null || true
+        return 1 ;;
+    esac
   fi
-  echo ">> 目标设备 $remote_dev 已确认为可移动 SD 介质 ✅"
 
   # 目标是 boot(FAT) 还是 rootfs(ext4)
   local tgt_fstype
   [ "$mode" = boot ] && tgt_fstype=vfat || tgt_fstype=ext4
 
-  # 在该设备下找目标分区(只认 $remote_dev 下的分区,不碰其他盘);取挂载点,未挂则挂临时点
-  local remote_mp=/mnt/sd_deploy
-  local p dev mountpoint
-  dev=$(sshpass -p root ssh $SSHOPTS "root@$ip" \
-    "lsblk -pn -o NAME,FSTYPE $remote_dev 2>/dev/null | awk -v t='$tgt_fstype' '\$2==t {print \$1; exit}'" 2>/dev/null | head -1)
-  [ -n "$dev" ] || { echo "[错误] 设备 $remote_dev 下未找到 $tgt_fstype 分区(确认已分区且含 $tgt_fstype)" >&2; return 1; }
-  mountpoint=$(sshpass -p root ssh $SSHOPTS "root@$ip" \
-    "m=\$(findmnt -rn -S '$dev' -o TARGET 2>/dev/null); if [ -n \"\$m\" ]; then echo \"\$m\"; else mkdir -p '$remote_mp' && mount '$dev' '$remote_mp' && echo '$remote_mp'; fi" 2>/dev/null | head -1)
-  [ -n "$mountpoint" ] || { echo "[错误] 无法挂载 $dev" >&2; return 1; }
+  # 该设备下找目标 fstype 分区。本板缺 lsblk/blkid/findmnt,但 /proc/mounts 可用
+  # (其列为: 设备 挂载点 fstype 选项 0 0),且系统已把 SD 分区自动挂载;据此解析。
+  local dev mountpoint=""
+  read -r dev mountpoint < <(sshpass -p root ssh $SSHOPTS "root@$ip" \
+    "awk -v d='$remote_dev' -v t='$tgt_fstype' '\$1 ~ (\"^\" d \"p\") && \$3==t {print \$1, \$2; exit}' /proc/mounts" 2>/dev/null) || true
+  if [ -z "$dev" ] || [ -z "$mountpoint" ]; then
+    echo "[错误] 设备 $remote_dev 下找不到已挂载的 $tgt_fstype 分区(确认分区已创建且已自动挂载;若未挂载请先 mount)" >&2; return 1
+  fi
   echo ">> 目标分区: $dev  挂载点: $mountpoint  ($tgt_fstype)"
 
   echo ">> 同步 $src → 板上 ${mountpoint}/ ..."
+  local rc=0
   if [ "$mode" = boot ]; then
-    # boot(FAT):只拷启动相关文件,排除非启动项(同 flash),不--delete 防误删 boot.scr
-    sshpass -p root rsync -rv --no-perms --no-owner --no-group \
-      --exclude='rootfs*' --exclude='pxelinux*' --exclude='vmlinux*' \
-      --exclude='*.cpio*' --exclude='*.jffs2' --exclude='*.ext4' \
-      --exclude='*.manifest' --exclude='config' --exclude='*.elf' \
-      -e "sshpass -p root ssh $SSHOPTS" \
-      "${src}/" "root@$ip:${mountpoint}/"
+    # boot(FAT):用 scp(板上为 dropbear,原生支持 scp、两端都无需 rsync);按名过滤非启动项;
+    # 只增不删,避免误删 boot.scr。scp -p 保留时间戳。
+    local f bn
+    for f in "$src"/*; do
+      [ -e "$f" ] || continue
+      bn="$(basename "$f")"
+      case "$bn" in
+        rootfs*|pxelinux*|vmlinux*|*.cpio*|*.jffs2|*.ext4|*.manifest|config|*.elf)
+          echo "  (跳过 $bn)"; continue ;;
+      esac
+      sshpass -p root scp $SSHOPTS -p "$f" "root@$ip:${mountpoint}/" >/dev/null || { echo "[!] 拷贝失败: $f" >&2; rc=1; }
+    done
   else
-    # fs(ext4):增量同步整目录,只传变化文件;用 --delete 保持与源一致(可选,去掉即只增不删)
-    sshpass -p root rsync -a --delete --delete-during \
-      -e "sshpass -p root ssh $SSHOPTS" \
-      "${src}/" "root@$ip:${mountpoint}/"
+    # fs(ext4):增量同步需板上 rsync;板上(busybox/dropbear 精简环境)通常没有,此时明确提示。
+    if sshpass -p root ssh $SSHOPTS "root@$ip" 'command -v rsync' >/dev/null 2>&1; then
+      sshpass -p root rsync -a --delete --delete-during \
+        -e "sshpass -p root ssh $SSHOPTS" \
+        "${src}/" "root@$ip:${mountpoint}/" || rc=1
+    else
+      echo "[错误] 板上无 rsync,-f 增量同步无法执行。两种选择:" >&2
+      echo "          1) 先给板装 rsync(嵌入式 petalinux 可构建 rsync 打包后上板);" >&2
+      echo "          2) 改用全量:tar -C '$src' -cf - . | sshpass -p root ssh $SSHOPTS root@$ip 'tar -C ${mountpoint} -xf -'  (覆盖同名字,但不删远端额外文件)" >&2
+      rc=1
+    fi
   fi
-  local rc=$?
   sshpass -p root ssh $SSHOPTS "root@$ip" "sync; umount '$mountpoint' 2>/dev/null || true" >/dev/null 2>&1
   if [ $rc -eq 0 ]; then echo ">> deploy($mode) 完成。拔电/reboot 后生效。"; else echo "[!] 同步出错(退出码 $rc)"; return $rc; fi
 }
