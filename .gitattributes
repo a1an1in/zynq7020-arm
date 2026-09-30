@@ -1,0 +1,32 @@
+# 统一源码行尾为 LF,避免 Windows(CRLF) 与 Linux(LF) 之间的提交差异
+# 兜底: 仓库整体统一 LF (eol=lf 优先于 core.autocrlf, 故 Windows Git 下也报 LF)
+* text=auto eol=lf
+*.sh       text eol=lf
+*.py       text eol=lf
+*.c        text eol=lf
+*.h        text eol=lf
+*.hpp      text eol=lf
+*.cpp      text eol=lf
+*.bb       text eol=lf
+*.bbappend text eol=lf
+*.conf     text eol=lf
+*.cfg      text eol=lf
+*.dts      text eol=lf
+*.dtsi     text eol=lf
+*.md       text eol=lf
+*.txt      text eol=lf
+*.json     text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.mk       text eol=lf
+Makefile   text eol=lf
+Dockerfile text eol=lf
+.gitignore text eol=lf
+
+# 二进制/大文件不参与行尾转换
+*.bit      binary
+*.bin      binary
+*.xsa      binary
+*.hdf      binary
+*.tar.gz   binary
+*.tgz      binary
