@@ -14,6 +14,21 @@
 #       # 工程容器内路径可覆盖:PETALINUX_PROJ=/work/<名>
 set -euo pipefail
 
+# 平台护栏: 仅允许在 WSL/Linux 下运行 (docker run + /mnt 挂载只在 WSL 成立)。
+# 在 Windows 原生 bash (Git Bash/MSYS/Cygwin) 里 $OSTYPE 是 msys/mingw/cygwin,
+# uname -s 以 MINGW/MSYS/CYGWIN 开头; WSL 与 Linux 均为 "Linux"。
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    cat >&2 <<'EOF'
+[错误] devops.sh 禁止在 Windows 原生环境运行。本脚本依赖 WSL 下的 docker 与
+      /mnt/c 等路径, 当前似乎是 Git Bash / MSYS / Cygwin (Windows bash)。
+      请改用 WSL 终端执行:
+          wsl bash                     # 进入 WSL
+          ./utils/devops.sh            # 或带命令参数
+EOF
+    exit 1 ;;
+esac
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMG_NAME="${IMG_NAME:-petalinux:2021.1}"
 SDK_HOST_DIR="${HERE}/sdk"

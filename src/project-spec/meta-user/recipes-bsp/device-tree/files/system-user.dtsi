@@ -1,3 +1,18 @@
 /include/ "system-conf.dtsi"
 / {
+	/*
+	 * aurora 手写寄存器窗口 (PL, 0x50000000 / 64 KiB)。
+	 * Vivado/PetaLinux 自动生成的 pl.dtsi 不会为外部主端口 M00_AXI 背后的
+	 * 手写 RTL 出节点，故在此手动声明 generic-uio:
+	 *   - compatible "generic-uio" 由内核 uio_pdrv_genirq 驱动绑定
+	 *     (CONFIG_UIO_PDRV_GENIRQ, 需 modprobe uio_pdrv_genirq 才挂载)
+	 *   - Zynq-7000 root #address-cells=<1>, 故 reg = <基址 尺寸>
+	 *   - 用户态 mmap(fd, NUMPAGES*PAGE_SIZE, ..., MAP_SHARED, /dev/uio0, 0)
+	 *     后偏移即窗内寄存器 (SCRATCH@0x00 / VERSION@0x04 / CTRL@0x08、
+	 *     LED_VALUE@0x10 / LED_CTRL@0x14 / LED_STATUS@0x18 等, 见 aurora_regs.h)
+	 */
+	aurora_regs: aurora@50000000 {
+		compatible = "generic-uio";
+		reg = <0x50000000 0x10000>;
+	};
 };
