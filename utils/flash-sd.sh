@@ -336,8 +336,8 @@ do_deploy() {
       sshpass -p root scp $SSHOPTS -p "$f" "root@$ip:${mountpoint}/" >/dev/null || { echo "[!] 拷贝失败: $f" >&2; rc=1; }
     done
   else
-    # fs(ext4):增量+镜像删除需板上 rsync(工程交叉静态版,板上自举;--numeric-ids 免静态 rsync
-    # 在无 NSS 库的板上做 uid→名解析致段错误)。源可为目录,也为 rootfs 归档(.tar.gz/.tgz/...):
+    # fs(ext4):增量+镜像删除需板上已带可用 rsync(工程交叉静态版;--numeric-ids 免静态
+    # rsync 在无 NSS 库的板上做 uid→名解析致段错误)。源可为目录,也为 rootfs 归档(.tar.gz/.tgz/...):
     # 若是归档则自动解压到临时目录,同步完成后删除。
     local srcdir="$src" tarsrc=""
     case "$src" in
@@ -353,9 +353,7 @@ do_deploy() {
         fi
         ;;
     esac
-    if sshpass -p root ssh $SSHOPTS "root@$ip" \
-        'if ! command -v rsync >/dev/null 2>&1; then for m in $(grep " vfat " /proc/mounts | cut -d" " -f2); do if [ -x "$m/tools/rsync" ]; then cp "$m/tools/rsync" /usr/bin/rsync; chmod 755 /usr/bin/rsync; echo ">> 已从 $m/tools/rsync 拉起板上 rsync"; break; fi; done; fi; command -v rsync' \
-        >/dev/null; then
+    if sshpass -p root ssh $SSHOPTS "root@$ip" 'command -v rsync >/dev/null 2>&1' >/dev/null; then
       local rlog; rlog="$(mktemp /tmp/deploy-rsync.XXXXXX)"
       echo ">> 同步 ${srcdir}/ → 板上 ${mountpoint}/ ..."
       if sshpass -p root rsync -i -a --delete --delete-during --numeric-ids \
@@ -369,8 +367,8 @@ do_deploy() {
       fi
       rm -f "$rlog"
     else
-      echo "[错误] 板上无 rsync 且自举失败(boot 分区未挂载,或其 tools/rsync 副本缺失)。" >&2
-      echo "        mount -t vfat /dev/${remote_dev}p1 /mnt 后重试;或经 utils 把静态 rsync 放 boot 的 tools/。" >&2
+      echo "[错误] 板上无 rsync(deploy -f 需板上已带可用的 rsync,工程交叉静态版)。" >&2
+      echo "        板 rootfs 已带 rsync 即可;否则先把静态 rsync 放 boot 的 tools/,并 mount -t vfat /dev/${remote_dev}p1 /mnt 后重试。" >&2
       rc=1
     fi
     { [ -n "$tarsrc" ] && rm -rf "$tarsrc"; } || true
