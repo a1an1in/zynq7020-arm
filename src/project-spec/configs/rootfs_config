@@ -3977,8 +3977,15 @@ CONFIG_auto-login=y
 #
 # apps 
 #
+CONFIG_fpga=y
 # CONFIG_gpio-demo is not set
 # CONFIG_peekpoke is not set
+CONFIG_s2mm-user=y
+
+#
+# modules 
+#
+CONFIG_xlnx-s2mm-test=y
 
 #
 # user packages 

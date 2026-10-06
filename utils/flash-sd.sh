@@ -28,6 +28,7 @@
 #   utils/flash-sd.sh flash ./src/images/linux
 #   utils/flash-sd.sh deploy -b ./src/images/linux root@192.168.1.100 mmcblk0   # 只换启动模块
 #   utils/flash-sd.sh deploy -f ./nfs/rootfs root@192.168.1.100 /dev/mmcblk0    # 增量同步文件系统
+#   probe <root@板IP> SSH 登板摸底/验证 SIMPLE 模式(与 deploy 同款 SSH 封装)
 #   utils/flash-sd.sh release
 set -euo pipefail
 
@@ -356,13 +357,24 @@ do_deploy() {
     if sshpass -p root ssh $SSHOPTS "root@$ip" 'command -v rsync >/dev/null 2>&1' >/dev/null; then
       local rlog; rlog="$(mktemp /tmp/deploy-rsync.XXXXXX)"
       echo ">> 同步 ${srcdir}/ → 板上 ${mountpoint}/ ..."
+      # 目标常常是"活"目标(automount 已把各分区挂在 /media/sd-* /mnt/sd-*,源里没有),
+      # 甚至是运行中的根。这些运行时伪文件系统/挂载点若不排除,--delete 会试着删它们,
+      # 对 busy 挂载点 rmdir 报 code23,或误删运行时文件。故一律排除:
+      #   proc/sys/dev/run/tmp  : 板上实际是 procfs/sysfs/devtmpfs/tmpfs
+      #   media/sd-* mnt/sd-*   : 板上 automount 的 sd 分区挂载点
+      #   mnt/deploy-*          : 上一次部署遗留的挂载点路径
+      local exx=( --exclude='proc' --exclude='sys' --exclude='dev'
+                  --exclude='run' --exclude='tmp'
+                  --exclude='media/sd-*' --exclude='mnt/sd-*'
+                  --exclude='mnt/deploy-*' )
       if sshpass -p root rsync -i -a --delete --delete-during --numeric-ids \
+          "${exx[@]}" \
           -e "sshpass -p root ssh $SSHOPTS" \
           "${srcdir}/" "root@$ip:${mountpoint}/" >"$rlog" 2>&1; then
         fs_change_report "$rlog" "$srcdir"
       else
-        echo "[!] rsync 同步出错,最近输出:" >&2
-        tail -30 "$rlog" >&2
+        echo "[!] rsync 同步出错,完整输出:" >&2
+        cat "$rlog" >&2
         rc=1
       fi
       rm -f "$rlog"
@@ -375,6 +387,32 @@ do_deploy() {
   fi
   sshpass -p root ssh $SSHOPTS "root@$ip" "sync; umount '$mountpoint' 2>/dev/null || true" >/dev/null 2>&1
   if [ $rc -eq 0 ]; then echo ">> deploy($mode) 完成。拔电/reboot 后生效。"; else echo "[!] 同步出错(退出码 $rc)"; return $rc; fi
+}
+# ---- probe: SSH 登板摸底(SIMPLE 模式生效验证,复用 deploy 同款 SSH) ------------
+#   用法: utils/flash-sd.sh probe root@板IP|板IP
+do_probe() {
+  local dst="${1:-}"
+  [ -n "$dst" ] || { echo "用法: utils/flash-sd.sh probe root@板IP|板IP"; return 1; }
+  local ip
+  case "$dst" in *@*) ip="${dst#*@}" ;; *) ip="$dst" ;; esac
+  local SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8"
+  echo "== 板 ${ip} 摸底 (SIMPLE 模式) =="
+  sshpass -p root ssh $SSHOPTS "root@$ip" '
+    echo "-- uname --"; uname -a
+    echo "  cmdline: $(cat /proc/cmdline)"
+    echo "-- dma@50000000 节点 --"
+    D=/proc/device-tree/amba_pl/dma@50000000
+    ls "$D" 2>&1 | grep -v "^$" | head -30
+    echo -n "  compatible   = "; cat "$D/compatible" 2>/dev/null; echo
+    echo -n "  include-sg?  = "; if [ -e "$D/xlnx,include-sg" ]; then echo "YES(仍是 SG!)"; else echo "NO (SIMPLE)"; fi
+    echo -n "  sg-length-width = "; cat "$D/xlnx,sg-length-width" 2>/dev/null | od -An -tx1; echo "(空/无=simple)"
+    echo "-- dmesg xilinx DMA 驱动 --"
+    dmesg 2>/dev/null | grep -iE "xilinx-vdma|xilinx_axidma|axi-dma|xlnx-s2mm|dma-chip|dmaengine" | tail -30
+    echo "-- /sys/class/dma 通道 --"
+    ls /sys/class/dma/ 2>/dev/null
+    echo "-- IRQ 61 --"; grep -w " 61 " /proc/interrupts 2>/dev/null
+  ' </dev/null 2>&1
+  echo "== probe done =="
 }
 # ---- 主入口 ----------------------------------------------------------------
 CMD="${1:-}"
@@ -389,6 +427,7 @@ case "$CMD" in
                if [ ! -b "${DEV}1" ]; then echo ">> ${DEV} 尚未分区,先分区..."; do_part "$DEV"; fi
                do_flash "$DEV" "$S" ;;
   deploy)      do_deploy "$@" ;;           # deploy -b|-f <源> <root@IP>,参数原样透传
+  probe)        do_probe "$@" ;;            # probe root@板IP 上板摸底/验证 SIMPLE
   -h|--help|help) usage ;;
   *) echo "未知子命令: $CMD"; usage ;;
 esac

@@ -31,8 +31,8 @@ __pycache__/
 *.pyc
 
 # ===== PetaLinux 硬件描述(hw-description) =====
-# 只跟踪权威硬件源 system.xsa(构建配置 HDF_PATH 直接引用)
-# 与比特流 system_wrapper.bit(plnxtool.conf 的 EXTRA_FILESLIST 直接引用)。
+# 只跟踪权威硬件源 system.xsa(构建配置 HDF_PATH 直接引用)。
+# 位流 *.bit 不托管(体积大;由 xsa/构建产生,本地保留供 EXTRA_FILESLIST 引用)。
 # 其余 ps7_init.* / metadata 均由 `petalinux-config --get-hw-description`
 # 从 system.xsa 重新解出,属派生物:体积大且内容为寄存器写表,diff 噪音极高,不入库。
 src/project-spec/hw-description/ps7_init.c
@@ -42,6 +42,7 @@ src/project-spec/hw-description/ps7_init_gpl.h
 src/project-spec/hw-description/ps7_init.tcl
 src/project-spec/hw-description/ps7_init.html
 src/project-spec/hw-description/metadata
+src/project-spec/hw-description/*.bit
 
 # ===== 本地运维笔记(含明文凭据,严禁入库) =====
 # utils/NOT_DELETE.md 记录线上容器灾难恢复命令,内含 MySQL root 密码与阿里云 AK/SK,

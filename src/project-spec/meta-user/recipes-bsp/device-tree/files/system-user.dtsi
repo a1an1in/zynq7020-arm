@@ -1,7 +1,7 @@
 /include/ "system-conf.dtsi"
 / {
 	/*
-	 * aurora 手写寄存器窗口 (PL, 0x50000000 / 64 KiB)。
+	 * aurora 手写寄存器窗口 (PL, 0x40000000 / 64 KiB)。
 	 * Vivado/PetaLinux 自动生成的 pl.dtsi 不会为外部主端口 M00_AXI 背后的
 	 * 手写 RTL 出节点，故在此手动声明 generic-uio:
 	 *   - compatible "generic-uio" 由内核 uio_pdrv_genirq 驱动绑定
@@ -11,8 +11,42 @@
 	 *     后偏移即窗内寄存器 (SCRATCH@0x00 / VERSION@0x04 / CTRL@0x08、
 	 *     LED_VALUE@0x10 / LED_CTRL@0x14 / LED_STATUS@0x18 等, 见 aurora_regs.h)
 	 */
-	aurora_regs: aurora@50000000 {
+	aurora_regs: aurora@40000000 {
 		compatible = "generic-uio";
-		reg = <0x50000000 0x10000>;
+		reg = <0x40000000 0x10000>;
+	};
+
+	/*
+	 * 兜底补中断:DTG 无法穿透 PL 的 util_vector_logic(OR 门) 为 AXI DMA 计算中断号,
+	 * 导致 dma-channel 缺 interrupts,驱动会因 irq=0 而 probe 失败(见 xilinx_dma_request_irq)。
+	 * AXI DMA 的 MM2S/S2MM 两路中断在 PL 内经 OR 门并入 IRQ_F2P[0] =>
+	 * Zynq-7000 GIC SPI 61(本板编码下 dts 写 29 即映射到该 SPI),高电平有效(type 4)。两 channel 共享该一路中断,
+	 * xilinx_dma 驱动以 IRQF_SHARED 请求,兼容共享。
+	 */
+	amba_pl {
+		dma@50000000 {
+			/* amba_pl 与根 /. 都无 interrupt-parent；不给它补上，
+			 * irq_of_parse_and_map 将解析不到 GIC 而回落到 0 →
+			 * request_irq(0) 失败，channel 不注册。intc 为现存 label。 */
+			interrupt-parent = <&intc>;
+			dma-channel@50000000 {
+				interrupts = <0 29 4>;
+				interrupt-names = "irq_mm2s";
+			};
+			dma-channel@50000030 {
+				interrupts = <0 29 4>;
+				interrupt-names = "irq_s2mm";
+			};
+		};
+
+		/* AXI-DMA S2MM dmaengine 客户节点:绑定 xlnx_s2mm_test.ko。
+		 * dmas = <&axi_dma_0 1>: args[0]=1 -> S2MM 通道
+		 * (chan->id=1, tdest=1-max/2=0 -> 取 interrupts[0]=SPI61 这三个字段中的第二个,
+		 * 与 XILINX_DMA_MAX_CHANS_PER_DEVICE=2 (s2mm_chan_id 从 max/2=1 起) 一致。 */
+		s2mm-test {
+			compatible = "xlnx,s2mm-test";
+			dmas = <&axi_dma_0 1>;
+			dma-names = "s2mm_channel";
+		};
 	};
 };

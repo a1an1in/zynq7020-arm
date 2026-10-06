@@ -3,3 +3,6 @@
 
 CONFIG_gpio-demo
 CONFIG_peekpoke
+CONFIG_s2mm-user
+CONFIG_xlnx-s2mm-test
+CONFIG_fpga
