@@ -264,7 +264,7 @@ do_deploy() {
   esac
   ensure_tools   # 确保 sshpass/rsync 就绪
 
-  local SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8"
+  local SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=8"
   echo ">> 连接 root@${ip} (密码 root) ..."
   if ! sshpass -p root ssh $SSHOPTS "root@$ip" 'echo ok' >/dev/null 2>&1; then
     echo "[错误] 无法 SSH 到 ${ip}(确认板已联网、sshd 已启动、密码为 root)" >&2; return 1
@@ -326,16 +326,22 @@ do_deploy() {
   if [ "$mode" = boot ]; then
     # boot(FAT):用 scp(板上为 dropbear,原生支持 scp、两端都无需 rsync);按名过滤非启动项;
     # 只增不删,避免误删 boot.scr。scp -p 保留时间戳。
-    local f bn
+    local f bn skipped=()
     for f in "$src"/*; do
       [ -e "$f" ] || continue
       bn="$(basename "$f")"
       case "$bn" in
         rootfs*|pxelinux*|vmlinux*|*.cpio*|*.jffs2|*.ext4|*.manifest|config|*.elf)
-          echo "  (跳过 $bn)"; continue ;;
+          skipped+=("$bn"); continue ;;
       esac
-      sshpass -p root scp $SSHOPTS -p "$f" "root@$ip:${mountpoint}/" >/dev/null || { echo "[!] 拷贝失败: $f" >&2; rc=1; }
+      if sshpass -p root scp $SSHOPTS -p "$f" "root@$ip:${mountpoint}/" >/dev/null 2>&1; then
+        echo "  → $bn"
+      else
+        echo "[!] 拷贝失败: $f" >&2; rc=1
+      fi
     done
+    [ ${#skipped[@]} -gt 0 ] && \
+      echo "  (跳过 ${#skipped[@]} 个非启动文件: ${skipped[*]})"
   else
     # fs(ext4):增量+镜像删除需板上已带可用 rsync(工程交叉静态版;--numeric-ids 免静态
     # rsync 在无 NSS 库的板上做 uid→名解析致段错误)。源可为目录,也为 rootfs 归档(.tar.gz/.tgz/...):
@@ -367,7 +373,7 @@ do_deploy() {
                   --exclude='run' --exclude='tmp'
                   --exclude='media/sd-*' --exclude='mnt/sd-*'
                   --exclude='mnt/deploy-*' )
-      if sshpass -p root rsync -i -a --delete --delete-during --numeric-ids \
+      if sshpass -p root rsync -i -a -c --delete --delete-during --numeric-ids \
           "${exx[@]}" \
           -e "sshpass -p root ssh $SSHOPTS" \
           "${srcdir}/" "root@$ip:${mountpoint}/" >"$rlog" 2>&1; then
@@ -395,7 +401,7 @@ do_probe() {
   [ -n "$dst" ] || { echo "用法: utils/flash-sd.sh probe root@板IP|板IP"; return 1; }
   local ip
   case "$dst" in *@*) ip="${dst#*@}" ;; *) ip="$dst" ;; esac
-  local SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8"
+  local SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=8"
   echo "== 板 ${ip} 摸底 (SIMPLE 模式) =="
   sshpass -p root ssh $SSHOPTS "root@$ip" '
     echo "-- uname --"; uname -a

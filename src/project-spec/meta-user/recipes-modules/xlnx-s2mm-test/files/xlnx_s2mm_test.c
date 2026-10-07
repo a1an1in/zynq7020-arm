@@ -38,12 +38,14 @@
 #include <linux/uaccess.h>
 #include <linux/fs.h>
 #include <linux/io.h>
+#include <linux/poll.h>
+#include <linux/wait.h>
+#include <linux/of_address.h>
 
 #define DRV_NAME		"xlnx-s2mm"
 
 /* Default capture buffer.  CMA on Zynq is 16 MiB, so 4 MiB is comfortable. */
 #define DEFAULT_BUF_SIZE	(4 * 1024 * 1024)
-#define DEFAULT_TIMEOUT_MS	5000
 
 /* Fake source (aurora_dma_src) control block, exposed on AXI GP0. */
 #define FAKE_SRC_BASE		0x40000000
@@ -55,7 +57,7 @@
  * frame (LEN*4) so the DMA BTT matches what the source actually emits.  A 4 MiB
  * request vs a short single frame never fills -> no IOC -> no interrupt, so default
  * to a small aligned capture; override via module param if the frame is bigger. */
-static unsigned int default_len = 256;
+static unsigned int default_len = 1024;
 module_param(default_len, uint, 0444);
 MODULE_PARM_DESC(default_len,
 	"S2MM capture bytes when TRIGGER len==0 (should equal fake-source frame LEN*4)");
@@ -78,54 +80,118 @@ struct xlnx_s2mm_dev {
 	dma_addr_t		dma_addr;
 	struct dma_chan		*chan;
 	struct mutex		lock;
-	struct completion	cmpl;
+	struct wait_queue_head	rx_wait;
+	struct fasync_struct	*fasync;
+	unsigned int		rx_len;
 	unsigned int		last_len;
-	bool			chan_bad;	/* DMA channel unrecoverably errored */
+	void __iomem		*dmaregs;	/* AXI-DMA regs (corrective only) */
 	void __iomem		*srcregs;	/* mapped fake-source control block */
 	struct miscdevice	misc;
 };
 
 static struct xlnx_s2mm_dev *s2mm_global;
 
-/* DMA completion callback (runs in IRQ/tasklet context). */
+/* DMA completion callback (runs in IRQ/tasklet context).  Non-blocking: just
+ * publish the length, flag arrival and wake any poll()/SIGIO waiter.  The
+ * ioctl() that armed this transfer has already returned to userspace. */
 static void s2mm_cb(void *param)
 {
-	complete(param);
+	struct xlnx_s2mm_dev *st = param;
+
+	WRITE_ONCE(st->last_len, st->rx_len);
+	kill_fasync(&st->fasync, SIGIO, POLL_IN);
+	wake_up_interruptible(&st->rx_wait);
 }
 
-static int do_s2mm_transfer(struct xlnx_s2mm_dev *st, unsigned int len)
+/* ---- AXI-DMA S2MM corrective maintenance (the transfer itself still goes
+ * 100% through dmaengine; we only pre-clean the channel so a stuck shared
+ * level IRQ can't storm the CPU) -------------------------------------- */
+/* AXI-DMA registers are intentionally NOT hardcoded: the controller base is
+ * resolved from the DT `dmas` phandle at probe time (see probe) so this driver
+ * stays board-portable -- no physical address is baked in.  Only the channel
+ * offsets are constants.  These are corrective-maintenance offsets; the actual
+ * transfer still runs 100% through dmaengine. */
+#define S2MM_DMACR		0x30
+#define S2MM_DMASR		0x34
+#define S2MM_DMACR_RS		BIT(0)
+#define S2MM_DMACR_RESET	BIT(2)
+#define S2MM_DMACR_IOC_IRQ_EN	BIT(12)	/* completion (IOC) interrupt enable */
+#define S2MM_DMACR_DLY_IRQ_EN	BIT(13)
+#define S2MM_DMACR_ERR_IRQ_EN	BIT(14)
+
+/*
+ * Put the S2MM channel in a known-clean state before each dmaengine
+ * transfer and again after a timeout:
+ *   1. stop the channel, disable error/delay IRQs (keep only IOC);
+ *   2. write-1-to-clear DMASR to release any latched completion/error level.
+ *      If we do NOT de-assert this, the shared level IRQ fires continuously,
+ *      the ISR cannot clear an unrecoverable error bit, and the CPU backs up
+ *      in an IRQ storm -> serial hangs (observed).
+ *   3. pulse a channel reset, then re-enable IOC.
+ */
+static void s2mm_dma_reset(struct xlnx_s2mm_dev *st)
+{
+	u32 dcr;
+	int i;
+
+	if (!st->dmaregs)
+		return;
+
+	/* stop the channel; keep only the IOC completion interrupt */
+	dcr = ioread32(st->dmaregs + S2MM_DMACR);
+	dcr &= ~(S2MM_DMACR_RS | S2MM_DMACR_DLY_IRQ_EN |
+		 S2MM_DMACR_ERR_IRQ_EN);
+	iowrite32(dcr, st->dmaregs + S2MM_DMACR);
+
+	/* write-1-to-clear: de-assert any stuck completion/error level */
+	iowrite32(0xffffffff, st->dmaregs + S2MM_DMASR);
+
+	/* channel reset (DMACR bit2 self-clears on completion) */
+	iowrite32(dcr | S2MM_DMACR_RESET, st->dmaregs + S2MM_DMACR);
+	for (i = 0; i < 100000 &&
+	     (ioread32(st->dmaregs + S2MM_DMACR) & S2MM_DMACR_RESET); i++)
+		;
+
+	/* re-enable just IOC so completion still wakes the dmaengine cb */
+	iowrite32(ioread32(st->dmaregs + S2MM_DMACR) | S2MM_DMACR_IOC_IRQ_EN,
+		  st->dmaregs + S2MM_DMACR);
+}
+
+/*
+ * Arm one asynchronous S2MM capture and return immediately.  When the DMA
+ * completes, dmaengine runs s2mm_cb() which stores last_len, sets rx_done and
+ * wakes rx_wait -- userspace observes the new frame via poll()/read() (or
+ * SIGIO if fasync was installed).  Nothing here blocks on completion.
+ */
+static int s2mm_start_async(struct xlnx_s2mm_dev *st, unsigned int len)
 {
 	struct dma_async_tx_descriptor *desc;
-	struct dma_slave_config cfg = { 0 };
 	dma_cookie_t cookie;
 	int ret;
 
-	if (st->chan_bad || !st->chan || !st->chan->device) {
-		dev_err(st->dev,
-			"DMA channel dead (chan_bad=%d chan=%p device=%p), "
-			"refusing further transfers; reinsert the module or reboot.\n",
-			st->chan_bad, st->chan,
-			st->chan ? st->chan->device : NULL);
-		return -ENODEV;
-	}
-
-	if (len == 0)
+	if (!len)
 		len = default_len;
 	if (len > st->buf_size) {
-		dev_err(st->dev, "length %u > buf_size %u\n", len, st->buf_size);
+		dev_err(st->dev, "len %u exceeds buffer %u\n", len,
+			st->buf_size);
 		return -EINVAL;
 	}
-	if (!st->chan) {
-		dev_err(st->dev, "no DMA channel\n");
-		return -ENODEV;
+	/* The fake source is word (32-bit) granular: a non-multiple-of-4 BTT
+	 * can never equal a real source frame, so the channel would wait
+	 * forever (DMA only retires once BTT is fully received, never on a
+	 * short frame).  Reject instead of silently hanging poll()/select(). */
+	if (len % 4) {
+		dev_err(st->dev,
+			"len %u not multiple of 4: BTT must equal source frame "
+			"(LEN*4 bytes)\n", len);
+		return -EINVAL;
 	}
 
+	/* Clean the channel (clear errors / de-assert any stuck level) so a
+	 * previously latched completion can't re-trigger an IRQ storm. */
+	s2mm_dma_reset(st);
+
 	memset(st->buf, 0, len);
-
-	/* AXI-DMA S2MM needs direction; width is optional for DRE. */
-	cfg.direction = DMA_DEV_TO_MEM;
-	dmaengine_slave_config(st->chan, &cfg);
-
 	desc = dmaengine_prep_slave_single(st->chan, st->dma_addr, len,
 					   DMA_DEV_TO_MEM,
 					   DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
@@ -133,49 +199,52 @@ static int do_s2mm_transfer(struct xlnx_s2mm_dev *st, unsigned int len)
 		dev_err(st->dev, "device_prep_slave_single failed\n");
 		return -EIO;
 	}
-
 	desc->callback = s2mm_cb;
 	desc->callback_param = st;
 
-	reinit_completion(&st->cmpl);
+	WRITE_ONCE(st->last_len, 0);
+	st->rx_len = len;
 	cookie = dmaengine_submit(desc);
 	ret = dma_submit_error(cookie);
 	if (ret)
 		return ret;
-
 	dma_async_issue_pending(st->chan);
 
-	/* Fake source is a single-frame, self-clearing trigger (NOT free-run), so
-	 * without an explicit RUN it emits nothing -> S2MM never fills -> no IOC
-	 * -> no interrupt.  Issue one frame sized == BTT so DMA has data and will
-	 * complete with an IOC interrupt.  len must be a multiple of 4 (32-bit). */
-	if (st->srcregs && (len % 4 == 0)) {
+	/* Trigger the (single-frame, self-clearing) fake source: frame size
+	 * must equal BTT so S2MM retires with one IOC. */
+	if (st->srcregs) {
 		iowrite32(len / 4, st->srcregs + FAKE_LEN_OFF);
 		iowrite32(1,  st->srcregs + FAKE_CTRL_OFF);
 	}
 
-	if (!wait_for_completion_timeout(&st->cmpl,
-					 msecs_to_jiffies(DEFAULT_TIMEOUT_MS))) {
-		st->chan_bad = true; /* level-IRQ sticky / stream starvation: wedge dead */
-		dmaengine_terminate_all(st->chan);
-		dev_err(st->dev,
-			"S2MM timeout: PL stream never delivered %u bytes; "
-			"channel marked bad, further transfers disabled\n",
-			len);
-		return -ETIMEDOUT;
-	}
-
-	dmaengine_synchronize(st->chan);
-	st->last_len = len;
-
-	dev_info(st->dev,
-		 "S2MM: received %u bytes (dev addr 0x%pad)\nfirst: %02x %02x %02x %02x\n",
-		 len, &st->dma_addr,
-		 ((unsigned char *)st->buf)[0],
-		 ((unsigned char *)st->buf)[1],
-		 ((unsigned char *)st->buf)[2],
-		 ((unsigned char *)st->buf)[3]);
+	dev_info(st->dev, "S2MM armed for %u bytes (async)\n", len);
 	return 0;
+}
+
+/* poll(): report readable once a frame has arrived (async notification). */
+static __poll_t s2mm_poll(struct file *f, poll_table *pt)
+{
+	struct xlnx_s2mm_dev *st = s2mm_global;
+	__poll_t mask = 0;
+
+	if (!st)
+		return EPOLLERR;
+	/* "readable" == data is actually available: single source of truth is
+	 * last_len (== rx_len a frame arrived in s2mm_cb), kept in sync with
+	 * Rx writer via WRITE_ONCE/READ_ONCE so select() can never report
+	 * ready while read() still sees 0 bytes. */
+	poll_wait(f, &st->rx_wait, pt);
+	if (READ_ONCE(st->last_len))
+		mask |= EPOLLIN | EPOLLRDNORM;
+	return mask;
+}
+
+/* fasync(): let app receive SIGIO when a frame arrives. */
+static int s2mm_fasync(int fd, struct file *f, int on)
+{
+	struct xlnx_s2mm_dev *st = s2mm_global;
+
+	return st ? fasync_helper(fd, f, on, &st->fasync) : -ENODEV;
 }
 
 /* ---- char device file operations ---- */
@@ -192,8 +261,10 @@ static long s2mm_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	case IOCTL_S2MM_TRIGGER:
 		if (copy_from_user(&len, (void __user *)arg, sizeof(len)))
 			return -EFAULT;
+		/* Arm only; the DMA completes asynchronously and the app is
+		 * notified via poll()/read() (or SIGIO). No blocking here. */
 		mutex_lock(&st->lock);
-		ret = do_s2mm_transfer(st, len);
+		ret = s2mm_start_async(st, len);
 		mutex_unlock(&st->lock);
 		return ret;
 	case IOCTL_S2MM_INFO:
@@ -215,14 +286,16 @@ static ssize_t s2mm_read(struct file *f, char __user *ubuf, size_t count,
 			 loff_t *ppos)
 {
 	struct xlnx_s2mm_dev *st = s2mm_global;
+	unsigned int avail;
 	size_t n;
 
-	if (!st || !st->last_len)
+	if (!st)
 		return 0;
-	if (*ppos >= st->last_len)
+	avail = READ_ONCE(st->last_len);
+	if (!avail || *ppos >= avail)
 		return 0;
 
-	n = min(count, (size_t)(st->last_len - *ppos));
+	n = min(count, (size_t)(avail - *ppos));
 	if (copy_to_user(ubuf, (char *)st->buf + *ppos, n))
 		return -EFAULT;
 	*ppos += n;
@@ -232,6 +305,8 @@ static ssize_t s2mm_read(struct file *f, char __user *ubuf, size_t count,
 static const struct file_operations s2mm_fops = {
 	.owner		= THIS_MODULE,
 	.read		= s2mm_read,
+	.poll		= s2mm_poll,
+	.fasync		= s2mm_fasync,
 	.unlocked_ioctl	= s2mm_ioctl,
 	.compat_ioctl	= s2mm_ioctl,
 };
@@ -250,7 +325,7 @@ static int s2mm_probe(struct platform_device *pdev)
 	st->pdev = pdev;
 	st->dev = dev;
 	mutex_init(&st->lock);
-	init_completion(&st->cmpl);
+	init_waitqueue_head(&st->rx_wait);
 
 	st->buf_size = DEFAULT_BUF_SIZE;
 	st->buf = dma_alloc_coherent(dev, st->buf_size, &st->dma_addr, GFP_KERNEL);
@@ -263,6 +338,20 @@ static int s2mm_probe(struct platform_device *pdev)
 	if (!st->srcregs)
 		dev_warn(dev, "ioremap fake-source %#x failed; source driven out-of-band\n",
 			 FAKE_SRC_BASE);
+
+	/* Resolve the AXI-DMA base portably from the DT `dmas` phandle so no
+	 * physical address is hardcoded.  The pointer is only used for the
+	 * corrective IRQ-storm pre-clean, never for the transfer itself. */
+	{
+		struct device_node *dma_np = of_parse_phandle(dev->of_node, "dmas", 0);
+
+		st->dmaregs = dma_np ? of_iomap(dma_np, 0) : NULL;
+		if (!st->dmaregs)
+			dev_warn(dev,
+				 "couldn't map AXI-DMA regs via dmas phandle; "
+				 "IRQ-storm pre-clean disabled\n");
+		of_node_put(dma_np);
+	}
 
 	/* Request the AXI-DMA S2MM channel via dma-names. */
 	st->chan = dma_request_chan(dev, "s2mm_channel");
@@ -310,6 +399,8 @@ static int s2mm_remove(struct platform_device *pdev)
 
 	if (st->srcregs)
 		iounmap(st->srcregs);
+	if (st->dmaregs)
+		iounmap(st->dmaregs);
 
 	if (st->chan)
 		dma_release_channel(st->chan);

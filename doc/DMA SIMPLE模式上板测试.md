@@ -76,9 +76,16 @@ busybox devmem 0x40000004 32   # 例: 读到 0x01000100 => 版本 1.0.1
 
 全部通过 ⇒ SIMPLE 模式链路（配置 / 搬运 / 中断）验收合格。
 
-## 4. 测试步骤
+## 4. 寄存器验证（busybox devmem 手工读写 AXI 寄存器）
 
-### 先离线判 DTB 是否 SIMPLE（构建用料对不对）
+> §4 仅用 `busybox devmem` **手工读写 AXI 寄存器**做最底层验证，不依赖任何内核驱动：
+> 读假源 VERSION → 直接写 DMA 的 `DMACR / DSTADDR / BTT` → 触发假源 `CTRL/RUN`，
+> 以 DDR 数据 + `DMASR` + GIC-61 判定寄存器级链路（配置 → 搬运 → 完成中断）。
+> 驱动/应用级（dmaengine + `/dev/xlnx-s2mm`）验证见 **§5 s2mm-user**。
+> （远程 bash 的 `PATH` 常为空，`devmem`/`busybox` 不在 PATH，需用绝对路径
+> `/bin/busybox devmem`。）
+
+### 前置：先离线判 DTB 是否 SIMPLE（构建用料对不对）
 
 跑下面的测试前，先离线确认 DTB 是 SIMPLE （`xlnx,include-sg` 缺失、`compatible=xlnx,axi-dma-7.1`），避免把 SG 的 BIT/DTB 拿来测。
 
@@ -114,7 +121,7 @@ grep -nE 'dma@50000000|include-sg|axi-dma-7.1|axi-vdma' \
 | 驱动 probe | `xilinx-vdma … Probed` | （vdma）|
 
 
-### 数据搬运 + 完成中断验证（开 IOC 一次跑通）
+### 寄存器验证：硬写寄存器发起一次 S2MM 搬运 + 完成中断
 
 > **⚠ 写序铁律（2026-10-06 实证定案）：`RS` 先、`BTT` 最后写。**
 > datamover 由**最后一次写 `BTT`** 触发开始消费（拉 `tready`）。若**先写 `BTT` 再写 `RS`**，
@@ -193,7 +200,79 @@ done
 
 ---
 
-## 5. 寄存器参考（SIMPLE / S2MM，axi_dma_0 base = 0x50000000）
+## 5. s2mm-user 应用验证（dmaengine 驱动链路 + /dev/xlnx-s2mm）
+
+> 与 §4 的 devmem 直写不同，本节省去手工编排 `DMACR/DSTADDR/BTT`，改走**内核 dmaengine**
+> 链路：`xlnx_s2mm_test.ko` 绑定 DT 节点 `xlnx,s2mm-test`，`dma_request_chan("s2mm_channel")`
+> 申请 AXI-DMA **S2MM** 通道，用 `dmaengine_prep_slave_single(DEV_TO_MEM)` 提交一次搬运，
+> 并**在驱动内部自动 `RUN` 假源**（假源是 self-clearing 单帧，不 RUN 不吐数据）；搬运完成后经
+> **IOC 完成中断**回调 `complete()`——与 §4 手动置 `IOC_IrqEn` 走的是同一条 GIC-61 中断——
+> 再经 `read()` 把捕获缓冲区交回用户态校验。**一次 `s2mm-user` 调用即完成**
+> 驱动→DMA 配置→假源→搬运→完成中断→读回数据的全链路验证。
+
+- 目标 IP：`axi_dma_0`（SIMPLE，同 §1）
+- 控制面：PS `M_AXI_GP0` → `axi_dma_0`（0x50000000）
+- 内核模块：`xlnx_s2mm_test.ko`（`recipes-modules/xlnx-s2mm-test/`）
+- 用户工具：`s2mm-user`（`recipes-apps/s2mm-user/`，打开 `/dev/xlnx-s2mm`）
+- 数据面：假源 `aurora_dma_src` → `S_AXIS_S2MM` → dmaengine S2MM → 内核 coherent 缓冲 → `read()` 回读
+
+### 5.1 前置条件（跑前先确认）
+
+1. **模块已装入并自动加载**（`xlnx-s2mm-test.bb` 设了 `KERNEL_MODULE_AUTOLOAD += "xlnx_s2mm_test"`）：
+   ```bash
+   ls -l /dev/xlnx-s2mm                 # 存在? 无 => 模块未加载 / DT 节点缺失
+   dmesg | grep -i xlnx-s2mm             # "Xilinx S2MM test driver: buf ... chan=dma1chan1" 即已 probe
+   ```
+   若缺：先 `modprobe xlnx_s2mm_test`；仍缺说明 DT 的 `xlnx,s2mm-test` 节点或 S2MM
+   `interrupts` 补丁（`system-user.dtsi`）未生效，需重编镜像。
+
+2. **PL 跑 simple 位流**（假源窗可读）：
+   ```bash
+   /bin/busybox devmem 0x40000004 32    # 可读到 VERSION（如 0x01000100）即假源/窗有效
+   ```
+
+3. **`s2mm-user` 在 PATH**：`which s2mm-user`。不指定长度时默认抓 `default_len` 字节
+   （假源单帧 `LEN×4`，见模块参数 `default_len`）。
+
+### 5.2 运行与验收
+
+```bash
+# ① 触发一次 S2MM 搬运并回读校验（默认 256 字节 = 假源 LEN=64 帧 × 4B）
+grep -w 61 /proc/interrupts
+s2mm-user 1024
+
+# ② 显式指定长度（须 = 假源整帧字节数，32-bit 源为 LEN*4），并用 xxd 查看前段字节
+s2mm-user 1024 | xxd | head              # 若假源 LEN=256 字/帧
+
+# ③ 核对完成中断 GIC-61 计数逐次 +1（IOC 完成中断，等同 §4 的 C4）
+s2mm-user 256 >/dev/null
+grep -w 61 /proc/interrupts              # 每触发一次，计数 +1
+```
+
+通过标准（对应 §3 的 C3/C4）：
+
+| 判据 | s2mm-user 证据 |
+|------|----------------|
+| C3 数据 | 打印 `captured N bytes`，首 32 字节出现 `5a a5 xx xx …`（`{16'h5AA5, idx}` 的字节序），且非全 0 |
+| C4 中断 | `dmesg` 出现 `S2MM: received N bytes (dev addr ...)`；`read()` 能返回数据即 IOC 完成回调已触发；`/proc/interrupts` GIC-61 计数 +1 |
+
+> s2mm-user 内部已代发假源 `RUN`（驱动 `do_s2mm_transfer` 在 `dma_async_issue_pending` 后
+> `iowrite32(1, FAKE_CTRL)`），**无需手动触发假源**；长度须为 4 的倍数且等于假源整帧字节
+> （`len = LEN*4`），否则 DMA 永远收不满、无完成中断（同 §6 寄存器表核对）。
+
+### 5.3 常见问题
+
+| 现象 | 处理 |
+|------|------|
+| `open /dev/xlnx-s2mm ...` 失败 | 模块未加载或 DT `xlnx,s2mm-test` 节点缺失，见 5.1 前置① |
+| `ioctl TRIGGER: ... (PL must be feeding S_AXIS_S2MM)` | 返回 errno，常见为假源/中断路径异常；先确认 5.1 前置②的 VERSION 可读 |
+| `ioctl TRIGGER: Cannot allocate memory` | `len > buf_size`（默认 4 MiB）；缩小长度或同步加大假源帧 |
+| `S2MM timeout: never delivered N bytes ... channel marked bad` | **数据落 DDR 但 completion 未触发** → 多半是电平中断粘滞被 GIC 掩蔽（§7.3）；通道已 `chan_bad`，需重插模块或 reboot；先用 §4 确认 DMASR 置完成位 + DDR 新帧 + irq 自增"三者齐备" |
+| `WARNING: captured data is all 0x00` | DMA 完成但捕获区全 0（PL 数据源异常 / 假源未真正发数据），查 PL 侧 |
+
+---
+
+## 6. 寄存器参考（SIMPLE / S2MM，axi_dma_0 base = 0x50000000）
 
 | 名称 | 偏移 | 位域 | 说明 |
 |------|------|------|------|
@@ -214,7 +293,7 @@ done
 
 ---
 
-## 6. 实测记录（2026-10-04 首测；2026-10-05 复核，simple bit）
+## 7. 实测记录（2026-10-04 首测；2026-10-05 复核，simple bit）
 
 **A. probe**：`include-sg? = NO (SIMPLE)`；`compatible = xlnx,axi-dma-7.1`；
 `xilinx-vdma ... Probed!!`；`s2mm-test ... chan=dma1chan1` → **C1/C2 ✅**
@@ -233,7 +312,7 @@ after:   55: 1  0  GIC-0 61 Level  xilinx-dma-controller           → **C4 ✅*
 
 **结论：SIMPLE 模式端到端（配置 C1/C2、搬运 C3、中断 C4）全部通过。**
 
-### 6.2 复核（2026-10-05，同一 SIMPLE bit + 现网 DTB 直接上板重验）
+### 7.2 复核（2026-10-05，同一 SIMPLE bit + 现网 DTB 直接上板重验）
 
 针对 "SIMPLE 完成中断疑似消失" 的排查，用 §4 同款触发流程在板上重跑，实测**中断正常**：
 
@@ -253,7 +332,7 @@ AFTER:   55:  1  0  GIC-0  61 Level  xilinx-dma-controller, xilinx-dma-controlle
 1. 中断只有**触发后才计数**：未触发时 61 恒为 0，属正常，不是中断缺失。
 2. `utils/flash-sd.sh probe` 里 `grep -w " 61 "` 会漏抓 `/proc/interrupts` 那行（误显示 "IRQ 61 为空"），是**工具写法问题**，不是没中断；核实请用 `grep -w 61 /proc/interrupts`。
 
-### 6.3 电平中断粘滞复测（2026-10-05，devmem 直写，待 2026-10-06 续查）
+### 7.3 电平中断粘滞复测（2026-10-05，devmem 直写，待 2026-10-06 续查）
 
 > 背景：`BTT=0x2000`+`源LEN=2048` 修好后，用 devmem 直写复测中断，发现**第三次计数不涨**。
 > 现象已复现并定位为**电平中断 + 粘滞 IOC_Irq 未撤除**，属"断点待续"。
@@ -283,15 +362,15 @@ AFTER:   55:  1  0  GIC-0  61 Level  xilinx-dma-controller, xilinx-dma-controlle
 1. IOC_Irq 粘滞位为何经 `DMAIRQ(0x5c)` 写 0x10 仍不清？可能是该 dma 的 IRQ 归内核 `xilinx-dma-controller` 驱动管理，devmem 直写与驱动抢占/驱动自行清位冲突；需查驱动是否在 ISR 里写同一位、或该 IP 的清除寄存器/清除值是否与标准 AXI DMA 不同。
 2. 用驱动路径 `board_s2mm_run2.sh`（`s2mm-user` ioctl）复测：每次触发后 ISR 清位 → 计数应逐次累加，用来区分"原始 devmem 清不掉" vs "真实链路只出一次"。
 3. 若确认是电平+粘滞导致永久掩蔽，可尝试：S2MM 复位/整 DMA reset、或改用边沿感知替代，观察 `irq61` 能否多次自增。
-4. 校验 §5 寄存器表：观察到的 IOC 完成在 `DMASR` **bit4(0x10)**，表内写的 bit12 疑似是 DMACR 的使能位，需勘误。
+4. 校验 §6 寄存器表：观察到的 IOC 完成在 `DMASR` **bit4(0x10)**，表内写的 bit12 疑似是 DMACR 的使能位，需勘误。
 5. **（2026-10-06 追加·勘误后修正）驱动路径 `s2mm-user` 超时/挂死排查——BTT 映射以 RTL 为准**：
-   - **假源是 32-bit**（`aurora_dma_src.v:DATA_WIDTH=32`，`m_tkeep=4'hF`，`m_tdata={16'h5AA5, idx[15:0]}`），每拍 **4 字节**，`BTT 必须 = 源LEN × 4`。这与 **`aurora_addr_def.vh:41`（"32bit 字 / BTT=len*4"）及 §6.2 表一致**。※此前一版曾先误判为 64-bit/×8（当时把 `*4` 当 bug 写成 `*8`），已据 RTL+仿真（`tdata=5aa5xxxx`、`tkeep=f`、`beats=LEN`）改回 32-bit/×4。
+   - **假源是 32-bit**（`aurora_dma_src.v:DATA_WIDTH=32`，`m_tkeep=4'hF`，`m_tdata={16'h5AA5, idx[15:0]}`），每拍 **4 字节**，`BTT 必须 = 源LEN × 4`。这与 **`aurora_addr_def.vh:41`（"32bit 字 / BTT=len*4"）及 §7.2 表一致**。※此前一版曾先误判为 64-bit/×8（当时把 `*4` 当 bug 写成 `*8`），已据 RTL+仿真（`tdata=5aa5xxxx`、`tkeep=f`、`beats=LEN`）改回 32-bit/×4。
    - `board_s2mm_run.sh` / `board_s2mm_run2.sh` / `board_s2mm_run3.sh` 一律 `BYTES=$((LEN*4))`（对应当前 32-bit 源，每拍 4 字节）。
-   - **真正的问题在完成/中断路径**：`LEN=64 → BTT=256`（32-bit 源，正确匹配）仍打印 "S2MM timeout: never delivered 256 bytes" ⇒ DMA 数据已落、但 **dmaengine completion 未触发**（§6.3 电平中断粘滞→GIC 掩蔽→无回调→模块 5s 超时→`terminate_all` 打向已掩蔽/卡死通道→系统死锁）。若 `direct` 自检 DDR 有 `5AA5xxxx`（32-bit 头）且 DMASR 完成位已置，即坐实"数据到位、中断没到"。
+   - **真正的问题在完成/中断路径**：`LEN=64 → BTT=256`（32-bit 源，正确匹配）仍打印 "S2MM timeout: never delivered 256 bytes" ⇒ DMA 数据已落、但 **dmaengine completion 未触发**（§7.3 电平中断粘滞→GIC 掩蔽→无回调→模块 5s 超时→`terminate_all` 打向已掩蔽/卡死通道→系统死锁）。若 `direct` 自检 DDR 有 `5AA5xxxx`（32-bit 头）且 DMASR 完成位已置，即坐实"数据到位、中断没到"。
    - **结论**：BTT 不算 bug；重点查 **IRQ/completion**（电平粘滞/掩蔽 + 旧模块无 `chan_bad` 兜底）。**测试一律用 `board_s2mm_run3.sh`（`BTT=LEN*4`，含 reserved-region `direct` 自检）**；模块缓冲为 `dma_alloc_coherent`（cache-coherent），**无需手动刷 cache**。下次连跑前先 build/deploy 带 `chan_bad` 的新模块，避免一次超时把系统捅死。
 ---
 
-## 7. 故障排查
+## 8. 故障排查
 
 | 现象 | 可能原因 / 处理 |
 |------|-----------------|

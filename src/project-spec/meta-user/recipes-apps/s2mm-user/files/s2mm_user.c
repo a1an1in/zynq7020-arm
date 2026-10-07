@@ -17,6 +17,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/time.h>
 
 #define DEV "/dev/xlnx-s2mm"
 
@@ -35,6 +37,7 @@ int main(int argc, char **argv)
 	struct s2mm_info info;
 	unsigned char *buf;
 	unsigned int len = 0;
+	unsigned int frame_len = 0;
 	int fd, ret, i, n;
 
 	fd = open(DEV, O_RDWR);
@@ -53,8 +56,13 @@ int main(int argc, char **argv)
 
 	if (argc > 1)
 		len = (unsigned int)strtoul(argv[1], NULL, 0);
+	/* No arg: use a frame-sized capture, NOT buf_size.  buf_size (4 MiB) is
+	 * the DMA buffer capacity, not the PL fake-source frame length; arming a
+	 * huge BTT truncates fake-source len_r and DMA retires having only filled
+	 * the head of the buffer while last_len still reports the full armed len.
+	 * 1024 is a tested-good capture size on this design. */
 	if (len == 0)
-		len = info.buf_size;
+		len = 1024;
 
 	buf = malloc(len ? len : 1);
 	if (!buf) {
@@ -71,12 +79,50 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	memset(buf, 0, len);
+	/* TRIGGER now returns immediately (async): block in select()/poll() until
+	 * the completion notification arrives, then read() the frame.  Only a
+	 * "readable" event (select() > 0, i.e. rx_done in the driver) means a
+	 * frame was captured -- timeout/error means no data, so do NOT read. */
+	{
+		fd_set rfds;
+		struct timeval tv;
+		int sr;
+		FD_ZERO(&rfds);
+		FD_SET(fd, &rfds);
+		tv.tv_sec  = 3;
+		tv.tv_usec = 0;
+		sr = select(fd + 1, &rfds, NULL, NULL, &tv);
+		if (sr <= 0) {
+			if (sr == 0)
+				printf("no completed frame within 3s "
+				       "(PL not delivering / frame length != BTT?\n");
+			else
+				perror("select");
+			free(buf);
+			close(fd);
+			return 2;
+		}
+		/* event: fd readable -> a frame is available; continue below */
+	}
+
+	/* select()/poll() do NOT report a byte count.  Query the driver AFTER
+	 * the event (never the pre-trigger snapshot) for the exact number this
+	 * frame delivered, then read exactly that many. */
+	frame_len = len;
+	{
+		struct s2mm_info done;
+		if (ioctl(fd, IOCTL_S2MM_INFO, &done) == 0 && done.last_len &&
+		    done.last_len <= len)
+			frame_len = done.last_len;
+	}
+	printf("frame: %u bytes available.\n", frame_len);
+
+	memset(buf, 0, frame_len);
 	n = 0;
 	{
 		ssize_t rd;
-		while ((size_t)n < info.last_len) {
-			rd = read(fd, buf + n, info.last_len - n);
+		while ((size_t)n < (size_t)frame_len) {
+			rd = read(fd, buf + n, (size_t)frame_len - n);
 			if (rd <= 0)
 				break;
 			n += (int)rd;
