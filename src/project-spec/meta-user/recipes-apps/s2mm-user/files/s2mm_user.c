@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/time.h>
 
@@ -64,9 +65,14 @@ int main(int argc, char **argv)
 	if (len == 0)
 		len = 1024;
 
-	buf = malloc(len ? len : 1);
-	if (!buf) {
-		perror("malloc");
+	/* Zero-copy: mmap the kernel-coherent DMA receive buffer straight into
+	 * this process instead of malloc() + read() copying.  We map the full
+	 * buffer capacity (buf_size); each completed frame occupies the head of
+	 * this mapping (offset 0).  The DMA writes into this same physical
+	 * memory, so no copy_to_user() occurs on the readback path. */
+	buf = mmap(NULL, info.buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (buf == MAP_FAILED) {
+		perror("mmap");
 		close(fd);
 		return 1;
 	}
@@ -74,15 +80,16 @@ int main(int argc, char **argv)
 	ret = ioctl(fd, IOCTL_S2MM_TRIGGER, &len);
 	if (ret < 0) {
 		perror("ioctl TRIGGER (PL must be feeding S_AXIS_S2MM)");
-		free(buf);
+		munmap(buf, info.buf_size);
 		close(fd);
 		return 1;
 	}
 
 	/* TRIGGER now returns immediately (async): block in select()/poll() until
-	 * the completion notification arrives, then read() the frame.  Only a
-	 * "readable" event (select() > 0, i.e. rx_done in the driver) means a
-	 * frame was captured -- timeout/error means no data, so do NOT read. */
+	 * the completion notification arrives, then read the frame straight from
+	 * the mmap'd DMA buffer.  Only a "readable" event (select() > 0, i.e.
+	 * rx_done in the driver) means a frame was captured -- timeout/error
+	 * means no data, so no frame is available. */
 	{
 		fd_set rfds;
 		struct timeval tv;
@@ -98,7 +105,7 @@ int main(int argc, char **argv)
 				       "(PL not delivering / frame length != BTT?\n");
 			else
 				perror("select");
-			free(buf);
+			munmap(buf, info.buf_size);
 			close(fd);
 			return 2;
 		}
@@ -117,17 +124,10 @@ int main(int argc, char **argv)
 	}
 	printf("frame: %u bytes available.\n", frame_len);
 
-	memset(buf, 0, frame_len);
-	n = 0;
-	{
-		ssize_t rd;
-		while ((size_t)n < (size_t)frame_len) {
-			rd = read(fd, buf + n, (size_t)frame_len - n);
-			if (rd <= 0)
-				break;
-			n += (int)rd;
-		}
-	}
+	/* Zero-copy readback: the DMA already wrote the frame into the head of
+	 * the mmap'd buffer (offset 0).  No read()/copy_to_user() is needed --
+	 * just point the analysis at buf[0..frame_len). */
+	n = (int)frame_len;
 
 	printf("captured %d bytes; first 32:\n", n);
 	for (i = 0; i < n && i < 32; i++)
@@ -143,7 +143,7 @@ int main(int argc, char **argv)
 			printf("WARNING: captured data is all 0x00\n");
 	}
 
-	free(buf);
+	munmap(buf, info.buf_size);
 	close(fd);
 	return 0;
 }

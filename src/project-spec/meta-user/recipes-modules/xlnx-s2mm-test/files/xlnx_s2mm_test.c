@@ -81,7 +81,6 @@ struct xlnx_s2mm_dev {
 	struct dma_chan		*chan;
 	struct mutex		lock;
 	struct wait_queue_head	rx_wait;
-	struct fasync_struct	*fasync;
 	unsigned int		rx_len;
 	unsigned int		last_len;
 	void __iomem		*dmaregs;	/* AXI-DMA regs (corrective only) */
@@ -92,14 +91,13 @@ struct xlnx_s2mm_dev {
 static struct xlnx_s2mm_dev *s2mm_global;
 
 /* DMA completion callback (runs in IRQ/tasklet context).  Non-blocking: just
- * publish the length, flag arrival and wake any poll()/SIGIO waiter.  The
+ * publish the length, flag arrival and wake any poll()/read() waiter.  The
  * ioctl() that armed this transfer has already returned to userspace. */
 static void s2mm_cb(void *param)
 {
 	struct xlnx_s2mm_dev *st = param;
 
 	WRITE_ONCE(st->last_len, st->rx_len);
-	kill_fasync(&st->fasync, SIGIO, POLL_IN);
 	wake_up_interruptible(&st->rx_wait);
 }
 
@@ -159,9 +157,9 @@ static void s2mm_dma_reset(struct xlnx_s2mm_dev *st)
 
 /*
  * Arm one asynchronous S2MM capture and return immediately.  When the DMA
- * completes, dmaengine runs s2mm_cb() which stores last_len, sets rx_done and
- * wakes rx_wait -- userspace observes the new frame via poll()/read() (or
- * SIGIO if fasync was installed).  Nothing here blocks on completion.
+ * completes, dmaengine runs s2mm_cb() which stores last_len and wakes
+ * rx_wait -- userspace observes the new frame via poll()/read().  Nothing
+ * here blocks on completion.
  */
 static int s2mm_start_async(struct xlnx_s2mm_dev *st, unsigned int len)
 {
@@ -239,14 +237,6 @@ static __poll_t s2mm_poll(struct file *f, poll_table *pt)
 	return mask;
 }
 
-/* fasync(): let app receive SIGIO when a frame arrives. */
-static int s2mm_fasync(int fd, struct file *f, int on)
-{
-	struct xlnx_s2mm_dev *st = s2mm_global;
-
-	return st ? fasync_helper(fd, f, on, &st->fasync) : -ENODEV;
-}
-
 /* ---- char device file operations ---- */
 static long s2mm_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
@@ -262,7 +252,7 @@ static long s2mm_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&len, (void __user *)arg, sizeof(len)))
 			return -EFAULT;
 		/* Arm only; the DMA completes asynchronously and the app is
-		 * notified via poll()/read() (or SIGIO). No blocking here. */
+		 * notified via poll()/read(). No blocking here. */
 		mutex_lock(&st->lock);
 		ret = s2mm_start_async(st, len);
 		mutex_unlock(&st->lock);
@@ -302,11 +292,31 @@ static ssize_t s2mm_read(struct file *f, char __user *ubuf, size_t count,
 	return n;
 }
 
+/*
+ * mmap(): expose the kernel-coherent DMA receive buffer directly to the app.
+ * The buffer is dma_alloc_coherent()'d, so it is physically contiguous and
+ * cache-coherent; mapping it into the app means the DMA writes land in memory
+ * the app can read straight away -- the read()/copy_to_user() path is skipped
+ * (zero-copy readback).  dma_mmap_coherent is the matching API for a buffer
+ * obtained with dma_alloc_coherent().
+ */
+static int s2mm_mmap(struct file *f, struct vm_area_struct *vma)
+{
+	struct xlnx_s2mm_dev *st = s2mm_global;
+	unsigned long size = vma->vm_end - vma->vm_start;
+
+	if (!st)
+		return -ENODEV;
+	if (size > st->buf_size)
+		return -EINVAL;
+	return dma_mmap_coherent(st->dev, vma, st->buf, st->dma_addr, size);
+}
+
 static const struct file_operations s2mm_fops = {
 	.owner		= THIS_MODULE,
 	.read		= s2mm_read,
 	.poll		= s2mm_poll,
-	.fasync		= s2mm_fasync,
+	.mmap		= s2mm_mmap,
 	.unlocked_ioctl	= s2mm_ioctl,
 	.compat_ioctl	= s2mm_ioctl,
 };
