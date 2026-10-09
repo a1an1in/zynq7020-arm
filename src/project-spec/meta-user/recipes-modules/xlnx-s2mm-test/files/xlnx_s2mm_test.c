@@ -309,6 +309,8 @@ static int s2mm_mmap(struct file *f, struct vm_area_struct *vma)
 		return -ENODEV;
 	if (size > st->buf_size)
 		return -EINVAL;
+	dev_info(st->dev, "s2mm_mmap: zero-copy mmap of %lu bytes (updated driver)\n",
+		 size);
 	return dma_mmap_coherent(st->dev, vma, st->buf, st->dma_addr, size);
 }
 
